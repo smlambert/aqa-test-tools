@@ -30,6 +30,7 @@ import {
     parsePublishedPlatforms,
     summarizeContainers,
     summarizeInstallers,
+    summarizeLinuxInstallers,
     summarizePlatforms,
     summarizeReleaseNotes,
     toPlatformKey,
@@ -180,9 +181,16 @@ const loadRelease = async (parentId) => {
     const sdk = asList(sdkBuilds);
     const tests = asList(testBuilds);
     const releaseName = getReleaseName(parent, [...sdk, ...tests]);
-    const [published, releaseNotes] = await Promise.all([
+    const [published, releaseNotes, linuxInstallers] = await Promise.all([
         fetchPublished(releaseName),
         fetchReleaseNotes(releaseName),
+        releaseName
+            ? fetchData(
+                  `/api/getLinuxInstallerBuilds?tag=${encodeURIComponent(
+                      releaseName
+                  )}`
+              )
+            : null,
     ]);
     const version = dockerVersionTag(releaseName);
     const docker = version
@@ -199,6 +207,7 @@ const loadRelease = async (parentId) => {
         version,
         published,
         releaseNotes,
+        linuxInstallers,
         dockerTags: docker && Array.isArray(docker.tags) ? docker.tags : null,
     };
 };
@@ -312,7 +321,56 @@ const StatusTag = ({ status, labels }) => {
     );
 };
 
-const Installers = ({ installers, publishedKnown }) => (
+const LINUX_TAGS = {
+    published: { color: 'success', text: 'published' },
+    warning: { color: 'warning', text: 'finished with warnings' },
+    failed: { color: 'error', text: 'failed' },
+    inprogress: { color: 'processing', text: 'running' },
+    pending: { color: 'default', text: 'not published' },
+};
+
+const LinuxInstallers = ({ linux }) => (
+    <div className="release-summary-linux">
+        <span>Linux packages (RPM / DEB / APK) </span>
+        {linux.status === 'unavailable' ? (
+            <Tag>Status unavailable</Tag>
+        ) : (
+            <>
+                <StatusTag
+                    status={linux.status}
+                    labels={{
+                        published: 'Published',
+                        partial: 'Partially published',
+                        pending: 'Not published',
+                        na: 'No Linux platforms',
+                    }}
+                />
+                <div>
+                    {linux.expected.map((p) => {
+                        const { color, text } = LINUX_TAGS[p.state];
+                        return (
+                            <Tag key={p.key} color={color} title={text}>
+                                {p.url ? (
+                                    <a
+                                        href={p.url}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                    >
+                                        {p.label}
+                                    </a>
+                                ) : (
+                                    p.label
+                                )}
+                            </Tag>
+                        );
+                    })}
+                </div>
+            </>
+        )}
+    </div>
+);
+
+const Installers = ({ installers, linux, publishedKnown }) => (
     <div className="release-summary-section">
         <div className="release-summary-section-title">
             Installers{' '}
@@ -339,6 +397,7 @@ const Installers = ({ installers, publishedKnown }) => (
                 {p.label}
             </Tag>
         ))}
+        <LinuxInstallers linux={linux} />
         {installers.jobs.length > 0 && (
             <ul className="release-summary-failures">
                 {installers.jobs.map((job) => (
@@ -432,6 +491,11 @@ const Release = ({ data, tckResults }) => {
         platforms,
         published: published || {},
     });
+    const linuxInstallers = summarizeLinuxInstallers({
+        platforms,
+        releaseName,
+        response: data.linuxInstallers,
+    });
     const containers = summarizeContainers(data.version, dockerTags || []);
 
     return (
@@ -524,6 +588,7 @@ const Release = ({ data, tckResults }) => {
             </Collapse>
             <Installers
                 installers={installers}
+                linux={linuxInstallers}
                 publishedKnown={published !== null}
             />
             <Containers containers={containers} loaded={dockerTags !== null} />

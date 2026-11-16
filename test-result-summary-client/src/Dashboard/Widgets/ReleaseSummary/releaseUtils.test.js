@@ -9,7 +9,9 @@ import {
     parseTestBuildName,
     releaseNameFromJavaVersion,
     summarizeContainers,
+    linuxInstallerPlatform,
     summarizeInstallers,
+    summarizeLinuxInstallers,
     summarizePlatforms,
     summarizeReleaseNotes,
     toPlatformKey,
@@ -218,6 +220,120 @@ describe('published, installers and containers', () => {
         expect(summarizeInstallers({ platforms: [platforms[2]] }).status).toBe(
             'na'
         );
+    });
+
+    describe('linux installers', () => {
+        const linux = (num, artifacts, result = 'SUCCESS', params = {}) =>
+            build('create_installer_linux', result, {
+                buildNum: num,
+                buildParams: [
+                    { name: 'TAG', value: params.tag || 'jdk-21.0.5+11' },
+                    { name: 'ARTIFACTS_TO_COPY', value: artifacts },
+                    ...Object.entries(params.flags || {}).map(
+                        ([name, value]) => ({ name, value })
+                    ),
+                ],
+            });
+        const platforms = [
+            { key: 'x64_linux', label: 'x64 Linux' },
+            { key: 'aarch64_alpine-linux', label: 'aarch64 Alpine Linux' },
+            { key: 'x64_mac', label: 'x64 Mac' },
+        ];
+
+        test('linuxInstallerPlatform', () => {
+            expect(
+                linuxInstallerPlatform(linux(1, 'a/linux/x64/jdk/*.tar.gz'))
+            ).toBe('x64_linux');
+            expect(
+                linuxInstallerPlatform(
+                    linux(1, 'a/alpine-linux/aarch64/jdk/*.tar.gz')
+                )
+            ).toBe('aarch64_alpine-linux');
+            // blank runs: other OS, no arch, several archs
+            expect(linuxInstallerPlatform(linux(1, 'a/mac/x64/b'))).toBeNull();
+            expect(linuxInstallerPlatform(linux(1, 'a/linux/b'))).toBeNull();
+            expect(
+                linuxInstallerPlatform(linux(1, 'a/linux/x64/b,a/linux/arm/b'))
+            ).toBeNull();
+            expect(linuxInstallerPlatform({})).toBeNull();
+        });
+
+        test('unavailable when Jenkins cannot be queried', () => {
+            const result = summarizeLinuxInstallers({
+                platforms,
+                releaseName: 'jdk-21.0.5+11',
+                response: { error: 'Error: boom' },
+            });
+            expect(result.status).toBe('unavailable');
+            expect(result.expected.map((p) => p.key)).toEqual([
+                'x64_linux',
+                'aarch64_alpine-linux',
+            ]);
+        });
+
+        test('uses the newest run per platform and ignores other runs', () => {
+            const result = summarizeLinuxInstallers({
+                platforms,
+                releaseName: 'jdk-21.0.5+11',
+                response: {
+                    builds: [
+                        linux(1, 'a/linux/x64/b', 'FAILURE'),
+                        linux(2, 'a/linux/x64/b', 'SUCCESS'),
+                        // other release and blank run are ignored
+                        linux(9, 'a/linux/x64/b', 'FAILURE', {
+                            tag: 'jdk-21.0.6+7',
+                        }),
+                        linux(10, 'a/mac/x64/b', 'NOT_BUILT'),
+                        linux(3, 'a/alpine-linux/aarch64/b', 'UNSTABLE'),
+                    ],
+                },
+            });
+            expect(result.status).toBe('partial');
+            expect(result.expected.map((p) => p.state)).toEqual([
+                'published',
+                'warning',
+            ]);
+        });
+
+        test('dry runs and skipped uploads are not published', () => {
+            const result = summarizeLinuxInstallers({
+                platforms,
+                releaseName: 'jdk-21.0.5+11',
+                response: {
+                    builds: [
+                        linux(1, 'a/linux/x64/b', 'SUCCESS', {
+                            flags: { DRY_RUN: 'true' },
+                        }),
+                        linux(2, 'a/alpine-linux/aarch64/b', 'SUCCESS', {
+                            flags: { SKIP_UPLOAD: 'true' },
+                        }),
+                    ],
+                },
+            });
+            expect(result.status).toBe('pending');
+            expect(result.expected.every((p) => p.state === 'pending')).toBe(
+                true
+            );
+        });
+
+        test('reports running, failed and published platforms', () => {
+            const running = linux(1, 'a/linux/x64/b', null, {});
+            running.status = 'NotDone';
+            const result = summarizeLinuxInstallers({
+                platforms,
+                releaseName: 'jdk-21.0.5+11',
+                response: {
+                    builds: [
+                        running,
+                        linux(2, 'a/alpine-linux/aarch64/b', 'FAILURE'),
+                    ],
+                },
+            });
+            expect(result.expected.map((p) => p.state)).toEqual([
+                'inprogress',
+                'failed',
+            ]);
+        });
     });
 
     test('summarizeContainers', () => {

@@ -60,6 +60,20 @@ const routes = {
     ],
     '(create_installer|sign_installer)': [b('create_installer_mac')],
     '^AQA_Test_Pipeline_JCK$': [],
+    '/api/getLinuxInstallerBuilds?tag=jdk-21.0.5+11': {
+        builds: [
+            b('create_installer_linux', 'SUCCESS', {
+                buildNum: 3,
+                buildParams: [
+                    { name: 'TAG', value: 'jdk-21.0.5+11' },
+                    {
+                        name: 'ARTIFACTS_TO_COPY',
+                        value: 'build/linux/x64/jdk/hotspot/*.tar.gz',
+                    },
+                ],
+            }),
+        ],
+    },
     '/api/getDockerTags': {
         count: 1,
         tags: [{ name: '21.0.5_11-jdk-noble', platforms: ['linux/amd64'] }],
@@ -147,6 +161,12 @@ test('renders summary for the selected pipeline', async () => {
     expect(text).toContain('Installers');
     expect(text).toContain('Containers');
     expect(text).toContain('linux/amd64');
+    expect(text).toContain('Linux packages (RPM / DEB / APK)');
+    expect(
+        container.querySelector(
+            'a[href="http://jenkins/create_installer_linux"]'
+        ).textContent
+    ).toBe('x64 Linux');
     // pipeline dropdown only lists release pipelines
     expect(
         fetchData.mock.calls.some(([u]) => u.includes('getBuildHistory'))

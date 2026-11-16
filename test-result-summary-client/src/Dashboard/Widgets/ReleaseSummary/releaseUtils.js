@@ -326,6 +326,86 @@ export const summarizeInstallers = ({
     };
 };
 
+const LINUX_ARCHS = ['aarch64', 'x64', 's390x', 'arm', 'ppc64le', 'riscv64'];
+const isTrue = (value) => String(value).toLowerCase() === 'true';
+
+/**
+ * Map a create_installer_linux run to its platform key (e.g. x64_linux,
+ * aarch64_alpine-linux) using the ARTIFACTS_TO_COPY parameter, in the same
+ * way as the job. Returns null for runs that do not map to exactly one
+ * Linux platform (the job starts such "blank" runs for other platforms).
+ */
+export const linuxInstallerPlatform = (build) => {
+    const artifacts = paramValue(build, 'ARTIFACTS_TO_COPY') || '';
+    const os = artifacts.includes('alpine-linux')
+        ? 'alpine-linux'
+        : artifacts.includes('linux')
+        ? 'linux'
+        : null;
+    const archs = LINUX_ARCHS.filter((arch) => artifacts.includes(`/${arch}/`));
+    return os && archs.length === 1 ? platformKey(archs[0], os) : null;
+};
+
+/**
+ * Linux installer (RPM/DEB/APK) status per Linux platform, from the runs of
+ * the create_installer_linux job. response is the getLinuxInstallerBuilds
+ * result: { builds } (or { error } if Jenkins could not be queried). Runs
+ * are matched to the release by their TAG
+ * parameter, and the newest run of each platform is the one that counts.
+ *
+ * Platform state is one of:
+ *   published  - run succeeded and uploaded the packages
+ *   warning    - run finished UNSTABLE (e.g. vulnerability scan findings)
+ *   failed     - run failed or was aborted
+ *   inprogress - run is still going
+ *   pending    - no run yet, or the run did not upload (DRY_RUN/SKIP_UPLOAD)
+ */
+export const summarizeLinuxInstallers = ({
+    platforms = [],
+    releaseName,
+    response,
+}) => {
+    const expected = platforms
+        .filter((p) => ['linux', 'alpine-linux'].includes(p.key.split('_')[1]))
+        .map((p) => ({ key: p.key, label: p.label, state: 'pending' }));
+    if (!releaseName || !response || !Array.isArray(response.builds)) {
+        return { status: 'unavailable', expected };
+    }
+
+    const latest = {};
+    (response.builds || []).forEach((build) => {
+        if (normalizeReleaseName(paramValue(build, 'TAG')) !== releaseName) {
+            return;
+        }
+        const key = linuxInstallerPlatform(build);
+        if (key && (!latest[key] || build.buildNum > latest[key].buildNum)) {
+            latest[key] = build;
+        }
+    });
+
+    expected.forEach((platform) => {
+        const build = latest[platform.key];
+        if (!build) return;
+        platform.url = build.buildUrl;
+        const kind = buildKind(build);
+        if (kind === 'inprogress') platform.state = 'inprogress';
+        else if (build.buildResult === 'SUCCESS') {
+            const uploaded =
+                !isTrue(paramValue(build, 'DRY_RUN')) &&
+                !isTrue(paramValue(build, 'SKIP_UPLOAD'));
+            platform.state = uploaded ? 'published' : 'pending';
+        } else if (build.buildResult === 'UNSTABLE') platform.state = 'warning';
+        else platform.state = 'failed';
+    });
+
+    const done = expected.filter((p) => p.state === 'published').length;
+    let status = 'pending';
+    if (expected.length === 0) status = 'na';
+    else if (done === expected.length) status = 'published';
+    else if (done > 0) status = 'partial';
+    return { status, expected };
+};
+
 /**
  * Container status from Docker Hub tags (eclipse-temurin official image)
  */

@@ -29,6 +29,7 @@ app.get('/getHistoryPerTest', require('./getHistoryPerTest'));
 app.get('/getJenkins', require('./getJenkins'));
 app.get('/getJenkinsBuildInfo', require('./test/getJenkinsBuildInfo'));
 app.get('/getLastBuildInfo', require('./getLastBuildInfo'));
+app.get('/getLinuxInstallerBuilds', require('./getLinuxInstallerBuilds'));
 app.get('/getLogStream', require('./getLogStream'));
 app.get('/getOutputById', require('./getOutputById'));
 app.get('/getOutputByTestInfo', require('./getOutputByTestInfo'));
