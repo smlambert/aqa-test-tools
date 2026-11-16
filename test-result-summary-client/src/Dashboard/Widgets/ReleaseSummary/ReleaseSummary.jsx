@@ -31,11 +31,13 @@ import {
     summarizeContainers,
     summarizeInstallers,
     summarizePlatforms,
+    summarizeReleaseNotes,
     toPlatformKey,
 } from './releaseUtils';
 import './ReleaseSummary.css';
 
 const ADOPTIUM_API = 'https://api.adoptium.net/v3/assets/release_name/eclipse';
+const RELEASE_NOTES_API = 'https://api.adoptium.net/v3/info/release_notes';
 const REFRESH_MS = 5 * 60 * 1000;
 const PIPELINE_HISTORY = 10;
 
@@ -62,6 +64,25 @@ const fetchPublished = async (releaseName) => {
         if (response.status === 404) return {};
         if (!response.ok) return null;
         return parsePublishedPlatforms(await response.json());
+    } catch (e) {
+        console.error(e);
+        return null;
+    }
+};
+
+// Returns null when the API cannot be reached (status unknown). A 404 means
+// the release notes are not published yet.
+const fetchReleaseNotes = async (releaseName) => {
+    if (!releaseName) return null;
+    try {
+        const response = await fetch(
+            `${RELEASE_NOTES_API}/${encodeURIComponent(releaseName)}`
+        );
+        if (response.status === 404) {
+            return summarizeReleaseNotes(releaseName, null);
+        }
+        if (!response.ok) return null;
+        return summarizeReleaseNotes(releaseName, await response.json());
     } catch (e) {
         console.error(e);
         return null;
@@ -159,7 +180,10 @@ const loadRelease = async (parentId) => {
     const sdk = asList(sdkBuilds);
     const tests = asList(testBuilds);
     const releaseName = getReleaseName(parent, [...sdk, ...tests]);
-    const published = await fetchPublished(releaseName);
+    const [published, releaseNotes] = await Promise.all([
+        fetchPublished(releaseName),
+        fetchReleaseNotes(releaseName),
+    ]);
     const version = dockerVersionTag(releaseName);
     const docker = version
         ? await fetchData(`/api/getDockerTags?name=${version}-jdk`)
@@ -174,6 +198,7 @@ const loadRelease = async (parentId) => {
         releaseName,
         version,
         published,
+        releaseNotes,
         dockerTags: docker && Array.isArray(docker.tags) ? docker.tags : null,
     };
 };
@@ -360,8 +385,40 @@ const Containers = ({ containers, loaded }) => (
     </div>
 );
 
+const ReleaseNotes = ({ releaseNotes, releaseName }) => (
+    <div className="release-summary-section">
+        <div className="release-summary-section-title">
+            Release Notes{' '}
+            {releaseNotes ? (
+                <StatusTag
+                    status={releaseNotes.status}
+                    labels={{
+                        published: 'Published',
+                        pending: 'Not published',
+                    }}
+                />
+            ) : (
+                <Tag>Publish status unavailable</Tag>
+            )}
+        </div>
+        {releaseNotes && releaseNotes.status === 'published' && (
+            <div className="release-summary-reasons">
+                {releaseNotes.count} item(s) |{' '}
+                <a href={releaseNotes.url} target="_blank" rel="noreferrer">
+                    View on adoptium.net
+                </a>
+            </div>
+        )}
+        {!releaseName && (
+            <div className="release-summary-reasons">
+                Release name could not be determined
+            </div>
+        )}
+    </div>
+);
+
 const Release = ({ data, tckResults }) => {
-    const { parent, releaseName, published, dockerTags } = data;
+    const { parent, releaseName, published, releaseNotes, dockerTags } = data;
     const platforms = buildPlatforms({
         sdkBuilds: data.sdkBuilds,
         testBuilds: data.testBuilds,
@@ -428,21 +485,12 @@ const Release = ({ data, tckResults }) => {
             </div>
             <Collapse>
                 <Collapse.Panel
-                    key="published"
-                    header={`Platforms Published (${counts.published})`}
+                    key="inprogress"
+                    header={`Platforms In Progress (${counts.inprogress})`}
                 >
                     <PlatformPanel
-                        platforms={by('published')}
-                        empty="No platforms published yet"
-                    />
-                </Collapse.Panel>
-                <Collapse.Panel
-                    key="ready"
-                    header={`Platforms Ready to Publish (${counts.ready})`}
-                >
-                    <PlatformPanel
-                        platforms={by('ready')}
-                        empty="No platforms are waiting to be published"
+                        platforms={by('inprogress')}
+                        empty="Nothing in progress"
                     />
                 </Collapse.Panel>
                 <Collapse.Panel
@@ -455,23 +503,34 @@ const Release = ({ data, tckResults }) => {
                         empty="No platforms require triage"
                     />
                 </Collapse.Panel>
-                {counts.inprogress > 0 && (
-                    <Collapse.Panel
-                        key="inprogress"
-                        header={`Platforms In Progress (${counts.inprogress})`}
-                    >
-                        <PlatformPanel
-                            platforms={by('inprogress')}
-                            empty="Nothing in progress"
-                        />
-                    </Collapse.Panel>
-                )}
+                <Collapse.Panel
+                    key="ready"
+                    header={`Platforms Ready to Publish (${counts.ready})`}
+                >
+                    <PlatformPanel
+                        platforms={by('ready')}
+                        empty="No platforms are waiting to be published"
+                    />
+                </Collapse.Panel>
+                <Collapse.Panel
+                    key="published"
+                    header={`Platforms Published (${counts.published})`}
+                >
+                    <PlatformPanel
+                        platforms={by('published')}
+                        empty="No platforms published yet"
+                    />
+                </Collapse.Panel>
             </Collapse>
             <Installers
                 installers={installers}
                 publishedKnown={published !== null}
             />
             <Containers containers={containers} loaded={dockerTags !== null} />
+            <ReleaseNotes
+                releaseNotes={releaseNotes}
+                releaseName={releaseName}
+            />
         </div>
     );
 };

@@ -400,3 +400,24 @@ export const dockerVersionTag = (releaseName) => {
         .replace(/^jdk(?=\d+u)/, '')
         .replace('+', '_');
 };
+
+export const releaseNotesWebUrl = (releaseName) =>
+    releaseName
+        ? `https://adoptium.net/temurin/release-notes?version=${encodeURIComponent(
+              releaseName
+          )}`
+        : null;
+
+/**
+ * Convert an Adoptium API release notes response (info/release_notes) to a
+ * summary. The notes are considered published when the API returns at least
+ * one entry; a 404 (handled by the caller) means they are not published yet.
+ */
+export const summarizeReleaseNotes = (releaseName, response) => {
+    const notes = (response && response.release_notes) || [];
+    return {
+        status: notes.length ? 'published' : 'pending',
+        count: notes.length,
+        url: releaseNotesWebUrl(releaseName),
+    };
+};

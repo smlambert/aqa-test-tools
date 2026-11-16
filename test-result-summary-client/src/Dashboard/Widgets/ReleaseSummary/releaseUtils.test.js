@@ -11,6 +11,7 @@ import {
     summarizeContainers,
     summarizeInstallers,
     summarizePlatforms,
+    summarizeReleaseNotes,
     toPlatformKey,
 } from './releaseUtils';
 
@@ -276,5 +277,25 @@ describe('release name', () => {
         expect(dockerVersionTag('jdk-21.0.5+11')).toBe('21.0.5_11');
         expect(dockerVersionTag('jdk8u432-b06')).toBe('8u432-b06');
         expect(dockerVersionTag(null)).toBeNull();
+    });
+});
+
+describe('release notes', () => {
+    test('summarizeReleaseNotes', () => {
+        expect(
+            summarizeReleaseNotes('jdk-21.0.5+11', {
+                release_notes: [{ id: 'JDK-1' }, { id: 'JDK-2' }],
+            })
+        ).toEqual({
+            status: 'published',
+            count: 2,
+            url: 'https://adoptium.net/temurin/release-notes?version=jdk-21.0.5%2B11',
+        });
+        expect(summarizeReleaseNotes('jdk-21.0.5+11', null).status).toBe(
+            'pending'
+        );
+        expect(
+            summarizeReleaseNotes('jdk-21.0.5+11', { release_notes: [] }).status
+        ).toBe('pending');
     });
 });

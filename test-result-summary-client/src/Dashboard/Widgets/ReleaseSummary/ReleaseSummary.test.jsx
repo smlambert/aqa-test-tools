@@ -66,7 +66,14 @@ const routes = {
     },
 };
 
+let notesResponse;
+
 beforeEach(() => {
+    notesResponse = {
+        status: 200,
+        ok: true,
+        json: async () => ({ release_notes: [{ id: 'JDK-1' }] }),
+    };
     global.IS_REACT_ACT_ENVIRONMENT = true;
     fetchData.mockImplementation(async (url) => {
         const key = Object.keys(routes).find((k) =>
@@ -74,21 +81,26 @@ beforeEach(() => {
         );
         return key ? routes[key] : [];
     });
-    global.fetch = jest.fn(async () => ({
-        status: 200,
-        ok: true,
-        json: async () => ({
-            binaries: [
-                { architecture: 'x64', os: 'linux', jvm_impl: 'hotspot' },
-                {
-                    architecture: 'x64',
-                    os: 'mac',
-                    jvm_impl: 'hotspot',
-                    installer: {},
-                },
-            ],
-        }),
-    }));
+    global.fetch = jest.fn(async (url) => {
+        if (url.includes('/info/release_notes/')) {
+            return notesResponse;
+        }
+        return {
+            status: 200,
+            ok: true,
+            json: async () => ({
+                binaries: [
+                    { architecture: 'x64', os: 'linux', jvm_impl: 'hotspot' },
+                    {
+                        architecture: 'x64',
+                        os: 'mac',
+                        jvm_impl: 'hotspot',
+                        installer: {},
+                    },
+                ],
+            }),
+        };
+    });
 });
 
 const flush = () => act(() => new Promise((r) => setTimeout(r, 20)));
@@ -114,6 +126,21 @@ test('renders summary for the selected pipeline', async () => {
     const text = container.textContent;
     expect(text).toContain('Release: jdk-21.0.5+11');
     expect(text).toContain('Platforms Published (2)');
+    const order = [
+        'Platforms In Progress',
+        'Platforms Requiring Triage',
+        'Platforms Ready to Publish',
+        'Platforms Published',
+    ].map((h) => text.indexOf(h));
+    expect(order.every((i) => i >= 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    expect(text).toContain('Release Notes');
+    expect(text).toContain('1 item(s)');
+    expect(
+        container.querySelector(
+            'a[href*="release-notes?version=jdk-21.0.5%2B11"]'
+        )
+    ).not.toBeNull();
     expect(text).toContain('Platforms Ready to Publish (0)');
     expect(text).toContain('Platforms Requiring Triage (1)');
     expect(text).toContain('67% published');
@@ -125,6 +152,23 @@ test('renders summary for the selected pipeline', async () => {
         fetchData.mock.calls.some(([u]) => u.includes('getBuildHistory'))
     ).toBe(true);
 
+    await act(async () => root.unmount());
+});
+
+test('reports release notes as not published on 404', async () => {
+    notesResponse = { status: 404, ok: false, json: async () => ({}) };
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+        root.render(
+            <ReleaseSummary pipelineSelected="p1" onChange={jest.fn()} />
+        );
+    });
+    await flush();
+    await flush();
+    const text = container.textContent;
+    expect(text).toMatch(/Release Notes\s*Not published/);
     await act(async () => root.unmount());
 });
 
