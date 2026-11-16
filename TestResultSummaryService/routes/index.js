@@ -21,6 +21,7 @@ app.get('/getBuildList', require('./getBuildList'));
 app.get('/getBuildStages', require('./getBuildStages'));
 app.get('/getChildBuilds', require('./getChildBuilds'));
 app.get('/getDashboardBuildInfo', require('./getDashboardBuildInfo'));
+app.get('/getDockerTags', require('./getDockerTags'));
 app.get('/getData', require('./getData'));
 app.get('/getErrorInOutput', require('./getErrorInOutput'));
 app.get('/getInternalGitIssues', require('./getInternalGitIssues'));
