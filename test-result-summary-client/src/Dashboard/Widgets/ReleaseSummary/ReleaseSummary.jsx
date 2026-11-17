@@ -622,7 +622,7 @@ const Release = ({ data, tckResults }) => {
                 />
             )}
             <Tooltip
-                title={`${counts.published} published, ${counts.ready} ready to publish, ${counts.triage} need triage, ${counts.inprogress} in progress`}
+                title={`${counts.total} platforms: ${counts.published} published, ${counts.ready} ready to publish, ${counts.triage} need triage, ${counts.inprogress} in progress`}
             >
                 <Progress
                     percent={counts.percentReady}
@@ -632,6 +632,10 @@ const Release = ({ data, tckResults }) => {
                 />
             </Tooltip>
             <div className="release-summary-counts">
+                <Tag>
+                    {counts.total} platform{counts.total === 1 ? '' : 's'} in
+                    this pipeline run
+                </Tag>
                 <Tag color="success">{counts.published} published</Tag>
                 <Tag color="processing">{counts.ready} ready</Tag>
                 <Tag color="error">{counts.triage} triage</Tag>

@@ -172,6 +172,7 @@ test('renders summary for the selected pipeline', async () => {
     expect(text).toContain('Platforms Ready to Publish (0)');
     expect(text).toContain('Platforms Requiring Triage (1)');
     expect(text).toContain('67% published');
+    expect(text).toContain('3 platforms in this pipeline run');
     expect(text).toContain('Installers');
     expect(text).toContain('Containers');
     expect(text).toContain('linux/amd64');
