@@ -3,10 +3,12 @@ import {
     dedupeTestBuilds,
     dockerVersionTag,
     getReleaseName,
+    findReleasePlan,
     getSourceTag,
     normalizeReleaseName,
     parsePublishedPlatforms,
     parseReleasePlan,
+    parseReleasePlanRevisions,
     pipelineRepo,
     releaseNextSteps,
     parseSdkBuildName,
@@ -421,14 +423,13 @@ describe('release notes', () => {
 });
 
 describe('source tag', () => {
-    const plan = parseReleasePlan(`# comment
+    test('parseReleasePlan', () => {
+        const plan = parseReleasePlan(`# comment
 #jdk8u372-dryrun-ga
 jdk8uGA="jdk8u514-ga"
 jdk21uGA="jdk-21.0.13.1-ga"
 jdk27uGA = 'jdk-27.0.1.1-ga'
 `);
-
-    test('parseReleasePlan', () => {
         expect(plan).toEqual({
             jdk8u: 'jdk8u514-ga',
             jdk21u: 'jdk-21.0.13.1-ga',
@@ -443,33 +444,152 @@ jdk27uGA = 'jdk-27.0.1.1-ga'
         expect(pipelineRepo('other')).toBeNull();
     });
 
-    const pipeline = (value) => ({
-        buildName: 'release-openjdk21-pipeline',
-        buildParams: value ? [{ name: 'scmReference', value }] : [],
-    });
-
-    test('uses the scmReference parameter and compares it to the plan', () => {
-        expect(getSourceTag(pipeline('jdk-21.0.13.1-ga'), plan)).toEqual({
-            tag: 'jdk-21.0.13.1-ga',
-            repo: 'jdk21u',
-            planned: 'jdk-21.0.13.1-ga',
-            fromPlan: false,
-            matchesPlan: true,
-            url: 'https://github.com/adoptium/jdk21u/releases/tag/jdk-21.0.13.1-ga',
+    test('parseReleasePlanRevisions sorts newest first', () => {
+        const commit = (sha, date) => ({
+            sha,
+            html_url: `https://github.com/c/${sha}`,
+            commit: { committer: { date } },
         });
-        expect(getSourceTag(pipeline('jdk-21.0.12-ga'), plan).matchesPlan).toBe(
-            false
-        );
-        expect(getSourceTag(pipeline('jdk-21.0.12-ga'), null).matchesPlan).toBe(
-            null
-        );
+        const revisions = parseReleasePlanRevisions([
+            commit('old', '2026-01-01T00:00:00Z'),
+            commit('new', '2026-03-01T00:00:00Z'),
+            { sha: 'bad', commit: {} },
+        ]);
+        expect(revisions.map((r) => r.sha)).toEqual(['new', 'old']);
+        expect(revisions[0].url).toBe('https://github.com/c/new');
+        expect(parseReleasePlanRevisions(null)).toEqual([]);
     });
 
-    test('falls back to the planned tag', () => {
-        const source = getSourceTag(pipeline(''), plan);
-        expect(source.tag).toBe('jdk-21.0.13.1-ga');
-        expect(source.fromPlan).toBe(true);
-        expect(getSourceTag(pipeline(''), null)).toBeNull();
+    describe('findReleasePlan', () => {
+        const day = (n) => Date.parse('2026-01-01T00:00:00Z') + n * 86400000;
+        // newest first
+        const revisions = [
+            { sha: 'r3', time: day(30) },
+            { sha: 'r2', time: day(20) },
+            { sha: 'r1', time: day(10) },
+        ];
+        const plans = {
+            r3: { jdk21u: 'jdk-21.0.13.1-ga' },
+            r2: { jdk21u: 'jdk-21.0.13-ga', jdk17u: 'jdk-17.0.21-ga' },
+            r1: { jdk21u: 'jdk-21.0.12-ga' },
+        };
+        // not jest.fn: CRA resets mock implementations before every test
+        let loaded;
+        const loadPlan = async (sha) => {
+            loaded.push(sha);
+            return plans[sha];
+        };
+        beforeEach(() => {
+            loaded = [];
+        });
+
+        test('finds the revision that lists the scmReference tag', async () => {
+            const result = await findReleasePlan({
+                revisions,
+                repo: 'jdk21u',
+                tag: 'jdk-21.0.13-ga',
+                startTime: day(40),
+                loadPlan,
+            });
+            expect(result.status).toBe('found');
+            expect(result.revision.sha).toBe('r2');
+            expect(loaded).toEqual(['r3', 'r2']);
+        });
+
+        test('without a tag uses the newest revision before the start', async () => {
+            const result = await findReleasePlan({
+                revisions,
+                repo: 'jdk21u',
+                startTime: day(25),
+                loadPlan,
+            });
+            expect(result.revision.sha).toBe('r2');
+            expect(result.plan.jdk21u).toBe('jdk-21.0.13-ga');
+        });
+
+        test('ignores revisions committed after the pipeline started', async () => {
+            const result = await findReleasePlan({
+                revisions,
+                repo: 'jdk21u',
+                tag: 'jdk-21.0.13.1-ga',
+                startTime: day(25),
+                loadPlan,
+            });
+            expect(result.status).toBe('notfound');
+            expect(loaded).not.toContain('r3');
+        });
+
+        test('skips revisions that do not list the repo', async () => {
+            const result = await findReleasePlan({
+                revisions,
+                repo: 'jdk17u',
+                startTime: day(40),
+                loadPlan,
+            });
+            expect(result.revision.sha).toBe('r2');
+        });
+
+        test('is not found without a repo, and propagates read errors', async () => {
+            expect(
+                (await findReleasePlan({ revisions, repo: null, loadPlan }))
+                    .status
+            ).toBe('notfound');
+            await expect(
+                findReleasePlan({
+                    revisions,
+                    repo: 'jdk21u',
+                    loadPlan: async () => {
+                        throw new Error('boom');
+                    },
+                })
+            ).rejects.toThrow('boom');
+        });
+    });
+
+    describe('getSourceTag', () => {
+        const pipeline = (value) => ({
+            buildName: 'release-openjdk21-pipeline',
+            buildParams: value ? [{ name: 'scmReference', value }] : [],
+        });
+        const revision = { sha: 'r2', time: 1, url: 'https://github.com/c/r2' };
+        const found = {
+            status: 'found',
+            revision,
+            plan: { jdk21u: 'jdk-21.0.13-ga' },
+        };
+
+        test('uses the scmReference parameter and the matching revision', () => {
+            expect(getSourceTag(pipeline('jdk-21.0.13-ga'), found)).toEqual({
+                tag: 'jdk-21.0.13-ga',
+                repo: 'jdk21u',
+                fromPlan: false,
+                revision,
+                planStatus: 'found',
+                url: 'https://github.com/adoptium/jdk21u/releases/tag/jdk-21.0.13-ga',
+            });
+        });
+
+        test('keeps the tag when no revision lists it', () => {
+            const source = getSourceTag(pipeline('jdk-21.0.99-ga'), {
+                status: 'notfound',
+            });
+            expect(source.tag).toBe('jdk-21.0.99-ga');
+            expect(source.planStatus).toBe('notfound');
+            expect(source.revision).toBeNull();
+            expect(
+                getSourceTag(pipeline('jdk-21.0.99-ga'), null).planStatus
+            ).toBe('unavailable');
+        });
+
+        test('falls back to the tag planned in the revision', () => {
+            const source = getSourceTag(pipeline(''), found);
+            expect(source.tag).toBe('jdk-21.0.13-ga');
+            expect(source.fromPlan).toBe(true);
+            expect(getSourceTag(pipeline(''), null)).toBeNull();
+            expect(
+                getSourceTag(pipeline(''), { status: 'notfound' })
+            ).toBeNull();
+        });
     });
 });
 

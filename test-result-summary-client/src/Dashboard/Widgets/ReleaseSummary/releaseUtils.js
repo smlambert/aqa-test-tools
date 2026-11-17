@@ -448,7 +448,7 @@ export const releaseNameFromJavaVersion = (javaVersion) => {
 
 const PUBLISH_PARAMS = ['overridePublishName', 'scmReference', 'publishName'];
 
-const paramValue = (build, name) => {
+export const paramValue = (build, name) => {
     const param = ((build && build.buildParams) || []).find(
         (p) => p.name === name
     );
@@ -504,11 +504,15 @@ export const summarizeReleaseNotes = (releaseName, response) => {
 
 /**
  * Source tag helpers. A release pipeline builds a tag from the
- * adoptium/jdk{N}u repository, and mirror-scripts releasePlan.cfg lists the
- * GA tag that is planned for each version, e.g. jdk21uGA="jdk-21.0.5-ga".
+ * adoptium/jdk{N}u repository. mirror-scripts releasePlan.cfg lists the GA tag
+ * that is planned for each version, e.g. jdk21uGA="jdk-21.0.5-ga". The file
+ * changes regularly, so the revision that relates to a pipeline is looked up
+ * in the file history rather than assuming the latest one.
  */
-export const RELEASE_PLAN_URL =
-    'https://raw.githubusercontent.com/adoptium/mirror-scripts/master/releasePlan.cfg';
+export const RELEASE_PLAN_COMMITS_URL =
+    'https://api.github.com/repos/adoptium/mirror-scripts/commits?path=releasePlan.cfg&per_page=100';
+export const releasePlanUrl = (sha) =>
+    `https://raw.githubusercontent.com/adoptium/mirror-scripts/${sha}/releasePlan.cfg`;
 
 // release-openjdk21-pipeline -> jdk21u (the repo and releasePlan.cfg name)
 export const pipelineRepo = (buildName) => {
@@ -528,24 +532,77 @@ export const parseReleasePlan = (text) => {
     return plan;
 };
 
+// GitHub commits API response -> [{ sha, date, time, url }], newest first
+export const parseReleasePlanRevisions = (commits) =>
+    (Array.isArray(commits) ? commits : [])
+        .map((c) => {
+            const date =
+                c.commit && c.commit.committer && c.commit.committer.date;
+            return {
+                sha: c.sha,
+                date,
+                time: Date.parse(date),
+                url: c.html_url,
+            };
+        })
+        .filter((r) => r.sha && !isNaN(r.time))
+        .sort((a, b) => b.time - a.time);
+
+// Revisions to look at in a lookup, so that an old or manually set tag does
+// not cause a request for every revision in the history
+const MAX_REVISIONS = 15;
+
+/**
+ * Find the releasePlan.cfg revision that relates to a pipeline.
+ *
+ * The pipeline used a revision that was committed before it started, so only
+ * those are searched, newest first. With a tag (the pipeline's scmReference),
+ * the first revision that lists it for the repo is the match. Without one, the
+ * newest revision that lists the repo is the one in effect.
+ *
+ * loadPlan(sha) returns the parsed plan of a revision and throws when it
+ * cannot be read. Returns { status: 'found', revision, plan } or
+ * { status: 'notfound' }.
+ */
+export const findReleasePlan = async ({
+    revisions = [],
+    repo,
+    tag,
+    startTime,
+    loadPlan,
+}) => {
+    if (!repo) return { status: 'notfound' };
+    const candidates = revisions
+        .filter((r) => !startTime || r.time <= startTime)
+        .slice(0, MAX_REVISIONS);
+    for (const revision of candidates) {
+        const plan = await loadPlan(revision.sha);
+        if (tag ? plan[repo] === tag : plan[repo]) {
+            return { status: 'found', revision, plan };
+        }
+    }
+    return { status: 'notfound' };
+};
+
 /**
  * The tag the pipeline is building, from its scmReference parameter. Without
- * one, the planned tag from releasePlan.cfg is used. plan is null when
- * releasePlan.cfg could not be read.
+ * one, the tag planned in the releasePlan.cfg revision in effect when the
+ * pipeline started is used. lookup is the findReleasePlan result, or null
+ * when the file history could not be read.
  */
-export const getSourceTag = (parent, plan) => {
+export const getSourceTag = (parent, lookup) => {
     const repo = pipelineRepo(parent && parent.buildName);
-    const planned = (repo && plan && plan[repo]) || null;
     const param = (paramValue(parent, 'scmReference') || '').trim();
-    const tag = param || planned;
+    const found = lookup && lookup.status === 'found' ? lookup : null;
+    const tag = param || (found && found.plan[repo]) || null;
     if (!tag) return null;
     return {
         tag,
         repo,
-        planned,
         fromPlan: !param,
-        // null when the plan is unknown
-        matchesPlan: planned ? tag === planned : null,
+        revision: found ? found.revision : null,
+        // found, notfound or unavailable
+        planStatus: lookup ? lookup.status : 'unavailable',
         url: repo
             ? `https://github.com/adoptium/${repo}/releases/tag/${encodeURIComponent(
                   tag

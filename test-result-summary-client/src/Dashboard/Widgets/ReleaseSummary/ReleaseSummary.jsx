@@ -24,14 +24,19 @@ import { fetchData } from '../../../utils/Utils';
 import { params } from '../../../utils/query';
 import {
     PIPELINE_REGEX,
-    RELEASE_PLAN_URL,
+    RELEASE_PLAN_COMMITS_URL,
     buildPlatforms,
     dockerVersionTag,
+    findReleasePlan,
     getReleaseName,
     getSourceTag,
     parsePublishedPlatforms,
     parseReleasePlan,
+    parseReleasePlanRevisions,
+    paramValue,
+    pipelineRepo,
     releaseNextSteps,
+    releasePlanUrl,
     summarizeContainers,
     summarizeInstallers,
     summarizeLinuxInstallers,
@@ -94,12 +99,55 @@ const fetchReleaseNotes = async (releaseName) => {
     }
 };
 
-// Returns null when releasePlan.cfg cannot be read
-const fetchReleasePlan = async () => {
+// The file history and each revision are cached because they are shared by
+// all pipelines (a revision never changes). GitHub limits unauthenticated API
+// requests, so the history is only requested again after REFRESH_MS.
+let revisionsCache = null;
+const planCache = new Map();
+
+const fetchJson = async (url, what) => {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`${what}: HTTP ${response.status}`);
+    return response;
+};
+
+const getRevisions = () => {
+    if (!revisionsCache || Date.now() - revisionsCache.at > REFRESH_MS) {
+        const promise = fetchJson(RELEASE_PLAN_COMMITS_URL, 'commits')
+            .then((r) => r.json())
+            .then(parseReleasePlanRevisions);
+        revisionsCache = { at: Date.now(), promise };
+        promise.catch(() => {
+            if (revisionsCache && revisionsCache.promise === promise) {
+                revisionsCache = null;
+            }
+        });
+    }
+    return revisionsCache.promise;
+};
+
+const loadPlan = (sha) => {
+    if (!planCache.has(sha)) {
+        const promise = fetchJson(releasePlanUrl(sha), 'releasePlan.cfg')
+            .then((r) => r.text())
+            .then(parseReleasePlan);
+        planCache.set(sha, promise);
+        promise.catch(() => planCache.delete(sha));
+    }
+    return planCache.get(sha);
+};
+
+// Finds the releasePlan.cfg revision that relates to the pipeline. Returns
+// null when the file history cannot be read.
+const fetchReleasePlan = async (parent) => {
     try {
-        const response = await fetch(RELEASE_PLAN_URL);
-        if (!response.ok) return null;
-        return parseReleasePlan(await response.text());
+        return await findReleasePlan({
+            revisions: await getRevisions(),
+            repo: pipelineRepo(parent.buildName),
+            tag: (paramValue(parent, 'scmReference') || '').trim(),
+            startTime: parent.timestamp,
+            loadPlan,
+        });
     } catch (e) {
         console.error(e);
         return null;
@@ -201,7 +249,7 @@ const loadRelease = async (parentId) => {
         await Promise.all([
             fetchPublished(releaseName),
             fetchReleaseNotes(releaseName),
-            fetchReleasePlan(),
+            fetchReleasePlan(parent),
             releaseName
                 ? fetchData(
                       `/api/getLinuxInstallerBuilds?tag=${encodeURIComponent(
@@ -495,7 +543,33 @@ const ReleaseNotes = ({ releaseNotes, releaseName }) => (
     </div>
 );
 
-const SourceTag = ({ source, planKnown }) => {
+const PlanRevision = ({ source }) => {
+    const { revision, planStatus, fromPlan } = source;
+    if (planStatus === 'found') {
+        return (
+            <>
+                {' | '}
+                {fromPlan ? 'planned in' : 'listed in'} releasePlan.cfg{' '}
+                <a href={revision.url} target="_blank" rel="noreferrer">
+                    {revision.sha.slice(0, 7)}
+                </a>{' '}
+                ({moment(revision.time).format('MMM DD YYYY')})
+            </>
+        );
+    }
+    if (planStatus === 'notfound') {
+        return (
+            <Tag style={{ marginLeft: 8 }}>
+                Not found in recent releasePlan.cfg revisions
+            </Tag>
+        );
+    }
+    return (
+        <Tag style={{ marginLeft: 8 }}>releasePlan.cfg history unavailable</Tag>
+    );
+};
+
+const SourceTag = ({ source }) => {
     if (!source) {
         return (
             <div className="release-summary-reasons">
@@ -514,15 +588,7 @@ const SourceTag = ({ source, planKnown }) => {
                 source.tag
             )}
             {source.repo && ` (adoptium/${source.repo})`}
-            {source.fromPlan && ' | from releasePlan.cfg'}
-            {source.matchesPlan === false && (
-                <Tag color="warning" style={{ marginLeft: 8 }}>
-                    releasePlan.cfg lists {source.planned}
-                </Tag>
-            )}
-            {!planKnown && source.fromPlan === false && (
-                <Tag style={{ marginLeft: 8 }}>releasePlan.cfg unavailable</Tag>
-            )}
+            <PlanRevision source={source} />
         </div>
     );
 };
@@ -601,7 +667,7 @@ const Release = ({ data, tckResults }) => {
                 >
                     Grid
                 </Link>
-                <SourceTag source={source} planKnown={releasePlan !== null} />
+                <SourceTag source={source} />
                 <div className="release-summary-reasons">
                     {releaseName ? (
                         <>Release: {releaseName}</>

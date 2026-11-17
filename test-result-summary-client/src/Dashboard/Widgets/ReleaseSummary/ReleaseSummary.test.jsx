@@ -43,6 +43,7 @@ const routes = {
         b('release-openjdk21-pipeline', 'SUCCESS', {
             _id: 'p1',
             buildNum: 7,
+            timestamp: Date.parse('2026-11-01T00:00:00Z'),
             buildParams: [
                 { name: 'overridePublishName', value: 'jdk-21.0.5+11' },
             ],
@@ -82,6 +83,12 @@ const routes = {
 
 let notesResponse;
 
+const planCommit = (sha, date) => ({
+    sha,
+    html_url: `https://github.com/adoptium/mirror-scripts/commit/${sha}`,
+    commit: { committer: { date } },
+});
+
 beforeEach(() => {
     notesResponse = {
         status: 200,
@@ -99,7 +106,21 @@ beforeEach(() => {
         if (url.includes('/info/release_notes/')) {
             return notesResponse;
         }
-        if (url.includes('releasePlan.cfg')) {
+        if (url.includes('api.github.com') && url.includes('/commits')) {
+            return {
+                status: 200,
+                ok: true,
+                json: async () => [
+                    // committed after the pipeline started, must be ignored
+                    planCommit('newer', '2026-12-01T00:00:00Z'),
+                    planCommit('abcdef1234', '2026-10-19T00:00:00Z'),
+                ],
+            };
+        }
+        if (url.includes('/newer/releasePlan.cfg')) {
+            throw new Error('revision after the pipeline start was requested');
+        }
+        if (url.includes('/abcdef1234/releasePlan.cfg')) {
             return {
                 status: 200,
                 ok: true,
@@ -156,7 +177,10 @@ test('renders summary for the selected pipeline', async () => {
     expect(order.every((i) => i >= 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
     expect(text).toContain('Building source tag: jdk-21.0.13.1-ga');
-    expect(text).toContain('from releasePlan.cfg');
+    expect(text).toContain('planned in releasePlan.cfg abcdef1');
+    expect(
+        container.querySelector('a[href$="/commit/abcdef1234"]')
+    ).not.toBeNull();
     expect(text).toContain('Remaining activities');
     expect(text).toContain('Triage the failures on 1 platform(s)');
     expect(text.indexOf('Remaining activities')).toBeGreaterThan(
