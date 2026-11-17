@@ -501,3 +501,145 @@ export const summarizeReleaseNotes = (releaseName, response) => {
         url: releaseNotesWebUrl(releaseName),
     };
 };
+
+/**
+ * Source tag helpers. A release pipeline builds a tag from the
+ * adoptium/jdk{N}u repository, and mirror-scripts releasePlan.cfg lists the
+ * GA tag that is planned for each version, e.g. jdk21uGA="jdk-21.0.5-ga".
+ */
+export const RELEASE_PLAN_URL =
+    'https://raw.githubusercontent.com/adoptium/mirror-scripts/master/releasePlan.cfg';
+
+// release-openjdk21-pipeline -> jdk21u (the repo and releasePlan.cfg name)
+export const pipelineRepo = (buildName) => {
+    const m = /openjdk(\d+)u?-pipeline/i.exec(buildName || '');
+    return m ? `jdk${m[1]}u` : null;
+};
+
+// jdk21uGA="jdk-21.0.5-ga" -> { jdk21u: 'jdk-21.0.5-ga' }
+export const parseReleasePlan = (text) => {
+    const plan = {};
+    String(text || '')
+        .split('\n')
+        .forEach((line) => {
+            const m = /^\s*(jdk\d+u)GA\s*=\s*["']?([^"'\s#]+)/.exec(line);
+            if (m) plan[m[1]] = m[2];
+        });
+    return plan;
+};
+
+/**
+ * The tag the pipeline is building, from its scmReference parameter. Without
+ * one, the planned tag from releasePlan.cfg is used. plan is null when
+ * releasePlan.cfg could not be read.
+ */
+export const getSourceTag = (parent, plan) => {
+    const repo = pipelineRepo(parent && parent.buildName);
+    const planned = (repo && plan && plan[repo]) || null;
+    const param = (paramValue(parent, 'scmReference') || '').trim();
+    const tag = param || planned;
+    if (!tag) return null;
+    return {
+        tag,
+        repo,
+        planned,
+        fromPlan: !param,
+        // null when the plan is unknown
+        matchesPlan: planned ? tag === planned : null,
+        url: repo
+            ? `https://github.com/adoptium/${repo}/releases/tag/${encodeURIComponent(
+                  tag
+              )}`
+            : null,
+    };
+};
+
+/**
+ * Short list of the activities that are still needed to complete the release.
+ * An empty list means nothing is left.
+ */
+export const releaseNextSteps = ({
+    counts,
+    platforms = [],
+    installers,
+    linux,
+    containers,
+    releaseNotes,
+    publishedKnown = true,
+    containersKnown = true,
+}) => {
+    const steps = [];
+    const names = (list) => list.map((p) => p.label).join(', ');
+    const by = (state) => platforms.filter((p) => p.state === state);
+
+    if (!publishedKnown) {
+        steps.push(
+            'Check the published binaries manually: the Adoptium API could not be reached'
+        );
+    }
+    if (counts.inprogress) {
+        steps.push(
+            `Wait for ${counts.inprogress} platform(s) to finish building and testing`
+        );
+    }
+    if (counts.triage) {
+        steps.push(
+            `Triage the failures on ${counts.triage} platform(s): ${names(
+                by('triage')
+            )}`
+        );
+    }
+    if (counts.ready) {
+        steps.push(
+            `Publish the binaries for ${counts.ready} platform(s): ${names(
+                by('ready')
+            )}`
+        );
+    }
+
+    if (publishedKnown) {
+        const missing = installers.expected.filter((p) => !p.published);
+        if (missing.length) {
+            steps.push(
+                `Publish the Windows and macOS installers for ${names(missing)}`
+            );
+        }
+    }
+
+    if (linux.status === 'unavailable') {
+        if (linux.expected.length) {
+            steps.push(
+                'Check the Linux packages manually: create_installer_linux status is unavailable'
+            );
+        }
+    } else {
+        const failed = linux.expected.filter((p) =>
+            ['failed', 'warning'].includes(p.state)
+        );
+        const waiting = linux.expected.filter((p) =>
+            ['pending', 'inprogress'].includes(p.state)
+        );
+        if (failed.length) {
+            steps.push(
+                `Investigate create_installer_linux for ${names(failed)}`
+            );
+        }
+        if (waiting.length) {
+            steps.push(
+                `Publish the Linux packages (RPM/DEB/APK) for ${names(waiting)}`
+            );
+        }
+    }
+
+    if (!containersKnown) {
+        steps.push(
+            'Check the container images manually: Docker Hub status is unavailable'
+        );
+    } else if (containers.status !== 'published') {
+        steps.push('Publish the container images on Docker Hub');
+    }
+    if (releaseNotes && releaseNotes.status !== 'published') {
+        steps.push('Publish the release notes');
+    }
+    return steps;
+};

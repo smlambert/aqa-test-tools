@@ -3,8 +3,12 @@ import {
     dedupeTestBuilds,
     dockerVersionTag,
     getReleaseName,
+    getSourceTag,
     normalizeReleaseName,
     parsePublishedPlatforms,
+    parseReleasePlan,
+    pipelineRepo,
+    releaseNextSteps,
     parseSdkBuildName,
     parseTestBuildName,
     releaseNameFromJavaVersion,
@@ -413,5 +417,125 @@ describe('release notes', () => {
         expect(
             summarizeReleaseNotes('jdk-21.0.5+11', { release_notes: [] }).status
         ).toBe('pending');
+    });
+});
+
+describe('source tag', () => {
+    const plan = parseReleasePlan(`# comment
+#jdk8u372-dryrun-ga
+jdk8uGA="jdk8u514-ga"
+jdk21uGA="jdk-21.0.13.1-ga"
+jdk27uGA = 'jdk-27.0.1.1-ga'
+`);
+
+    test('parseReleasePlan', () => {
+        expect(plan).toEqual({
+            jdk8u: 'jdk8u514-ga',
+            jdk21u: 'jdk-21.0.13.1-ga',
+            jdk27u: 'jdk-27.0.1.1-ga',
+        });
+        expect(parseReleasePlan(null)).toEqual({});
+    });
+
+    test('pipelineRepo', () => {
+        expect(pipelineRepo('release-openjdk21-pipeline')).toBe('jdk21u');
+        expect(pipelineRepo('release-openjdk8u-pipeline')).toBe('jdk8u');
+        expect(pipelineRepo('other')).toBeNull();
+    });
+
+    const pipeline = (value) => ({
+        buildName: 'release-openjdk21-pipeline',
+        buildParams: value ? [{ name: 'scmReference', value }] : [],
+    });
+
+    test('uses the scmReference parameter and compares it to the plan', () => {
+        expect(getSourceTag(pipeline('jdk-21.0.13.1-ga'), plan)).toEqual({
+            tag: 'jdk-21.0.13.1-ga',
+            repo: 'jdk21u',
+            planned: 'jdk-21.0.13.1-ga',
+            fromPlan: false,
+            matchesPlan: true,
+            url: 'https://github.com/adoptium/jdk21u/releases/tag/jdk-21.0.13.1-ga',
+        });
+        expect(getSourceTag(pipeline('jdk-21.0.12-ga'), plan).matchesPlan).toBe(
+            false
+        );
+        expect(getSourceTag(pipeline('jdk-21.0.12-ga'), null).matchesPlan).toBe(
+            null
+        );
+    });
+
+    test('falls back to the planned tag', () => {
+        const source = getSourceTag(pipeline(''), plan);
+        expect(source.tag).toBe('jdk-21.0.13.1-ga');
+        expect(source.fromPlan).toBe(true);
+        expect(getSourceTag(pipeline(''), null)).toBeNull();
+    });
+});
+
+describe('releaseNextSteps', () => {
+    const platforms = [
+        { key: 'x64_linux', label: 'x64 Linux', state: 'ready' },
+        { key: 'x64_mac', label: 'x64 Mac', state: 'triage' },
+    ];
+    const done = {
+        counts: { inprogress: 0, triage: 0, ready: 0 },
+        platforms: [],
+        installers: { expected: [] },
+        linux: { status: 'published', expected: [] },
+        containers: { status: 'published' },
+        releaseNotes: { status: 'published' },
+    };
+
+    test('is empty when everything is published', () => {
+        expect(releaseNextSteps(done)).toEqual([]);
+    });
+
+    test('lists what is left to do', () => {
+        const steps = releaseNextSteps({
+            ...done,
+            counts: { inprogress: 2, triage: 1, ready: 1 },
+            platforms,
+            installers: {
+                expected: [
+                    { label: 'x64 Mac', published: false },
+                    { label: 'x64 Windows', published: true },
+                ],
+            },
+            linux: {
+                status: 'partial',
+                expected: [
+                    { label: 'x64 Linux', state: 'failed' },
+                    { label: 'aarch64 Linux', state: 'pending' },
+                    { label: 'ppc64le Linux', state: 'published' },
+                ],
+            },
+            containers: { status: 'pending' },
+            releaseNotes: { status: 'pending' },
+        });
+        expect(steps).toEqual([
+            'Wait for 2 platform(s) to finish building and testing',
+            'Triage the failures on 1 platform(s): x64 Mac',
+            'Publish the binaries for 1 platform(s): x64 Linux',
+            'Publish the Windows and macOS installers for x64 Mac',
+            'Investigate create_installer_linux for x64 Linux',
+            'Publish the Linux packages (RPM/DEB/APK) for aarch64 Linux',
+            'Publish the container images on Docker Hub',
+            'Publish the release notes',
+        ]);
+    });
+
+    test('asks for a manual check when a status is unavailable', () => {
+        const steps = releaseNextSteps({
+            ...done,
+            publishedKnown: false,
+            containersKnown: false,
+            linux: { status: 'unavailable', expected: platforms },
+            releaseNotes: null,
+        });
+        expect(steps).toHaveLength(3);
+        expect(steps.join(' ')).toMatch(/Adoptium API/);
+        expect(steps.join(' ')).toMatch(/create_installer_linux/);
+        expect(steps.join(' ')).toMatch(/Docker Hub/);
     });
 });

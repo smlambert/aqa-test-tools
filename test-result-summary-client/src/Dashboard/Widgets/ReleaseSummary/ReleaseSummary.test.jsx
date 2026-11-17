@@ -99,6 +99,13 @@ beforeEach(() => {
         if (url.includes('/info/release_notes/')) {
             return notesResponse;
         }
+        if (url.includes('releasePlan.cfg')) {
+            return {
+                status: 200,
+                ok: true,
+                text: async () => 'jdk21uGA="jdk-21.0.13.1-ga"\n',
+            };
+        }
         return {
             status: 200,
             ok: true,
@@ -148,6 +155,13 @@ test('renders summary for the selected pipeline', async () => {
     ].map((h) => text.indexOf(h));
     expect(order.every((i) => i >= 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
+    expect(text).toContain('Building source tag: jdk-21.0.13.1-ga');
+    expect(text).toContain('from releasePlan.cfg');
+    expect(text).toContain('Remaining activities');
+    expect(text).toContain('Triage the failures on 1 platform(s)');
+    expect(text.indexOf('Remaining activities')).toBeGreaterThan(
+        text.indexOf('Release Notes')
+    );
     expect(text).toContain('Release Notes');
     expect(text).toContain('1 item(s)');
     expect(

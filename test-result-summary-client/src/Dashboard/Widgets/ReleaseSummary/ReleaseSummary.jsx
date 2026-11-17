@@ -24,10 +24,14 @@ import { fetchData } from '../../../utils/Utils';
 import { params } from '../../../utils/query';
 import {
     PIPELINE_REGEX,
+    RELEASE_PLAN_URL,
     buildPlatforms,
     dockerVersionTag,
     getReleaseName,
+    getSourceTag,
     parsePublishedPlatforms,
+    parseReleasePlan,
+    releaseNextSteps,
     summarizeContainers,
     summarizeInstallers,
     summarizeLinuxInstallers,
@@ -84,6 +88,18 @@ const fetchReleaseNotes = async (releaseName) => {
         }
         if (!response.ok) return null;
         return summarizeReleaseNotes(releaseName, await response.json());
+    } catch (e) {
+        console.error(e);
+        return null;
+    }
+};
+
+// Returns null when releasePlan.cfg cannot be read
+const fetchReleasePlan = async () => {
+    try {
+        const response = await fetch(RELEASE_PLAN_URL);
+        if (!response.ok) return null;
+        return parseReleasePlan(await response.text());
     } catch (e) {
         console.error(e);
         return null;
@@ -181,17 +197,19 @@ const loadRelease = async (parentId) => {
     const sdk = asList(sdkBuilds);
     const tests = asList(testBuilds);
     const releaseName = getReleaseName(parent, [...sdk, ...tests]);
-    const [published, releaseNotes, linuxInstallers] = await Promise.all([
-        fetchPublished(releaseName),
-        fetchReleaseNotes(releaseName),
-        releaseName
-            ? fetchData(
-                  `/api/getLinuxInstallerBuilds?tag=${encodeURIComponent(
-                      releaseName
-                  )}`
-              )
-            : null,
-    ]);
+    const [published, releaseNotes, releasePlan, linuxInstallers] =
+        await Promise.all([
+            fetchPublished(releaseName),
+            fetchReleaseNotes(releaseName),
+            fetchReleasePlan(),
+            releaseName
+                ? fetchData(
+                      `/api/getLinuxInstallerBuilds?tag=${encodeURIComponent(
+                          releaseName
+                      )}`
+                  )
+                : null,
+        ]);
     const version = dockerVersionTag(releaseName);
     const docker = version
         ? await fetchData(`/api/getDockerTags?name=${version}-jdk`)
@@ -207,6 +225,7 @@ const loadRelease = async (parentId) => {
         version,
         published,
         releaseNotes,
+        releasePlan,
         linuxInstallers,
         dockerTags: docker && Array.isArray(docker.tags) ? docker.tags : null,
     };
@@ -476,8 +495,67 @@ const ReleaseNotes = ({ releaseNotes, releaseName }) => (
     </div>
 );
 
+const SourceTag = ({ source, planKnown }) => {
+    if (!source) {
+        return (
+            <div className="release-summary-reasons">
+                Source tag could not be determined
+            </div>
+        );
+    }
+    return (
+        <div className="release-summary-reasons">
+            Building source tag:{' '}
+            {source.url ? (
+                <a href={source.url} target="_blank" rel="noreferrer">
+                    {source.tag}
+                </a>
+            ) : (
+                source.tag
+            )}
+            {source.repo && ` (adoptium/${source.repo})`}
+            {source.fromPlan && ' | from releasePlan.cfg'}
+            {source.matchesPlan === false && (
+                <Tag color="warning" style={{ marginLeft: 8 }}>
+                    releasePlan.cfg lists {source.planned}
+                </Tag>
+            )}
+            {!planKnown && source.fromPlan === false && (
+                <Tag style={{ marginLeft: 8 }}>releasePlan.cfg unavailable</Tag>
+            )}
+        </div>
+    );
+};
+
+const NextSteps = ({ steps }) => (
+    <div className="release-summary-section">
+        <div className="release-summary-section-title">
+            Remaining activities
+        </div>
+        {steps.length ? (
+            <ul className="release-summary-failures">
+                {steps.map((step) => (
+                    <li key={step}>{step}</li>
+                ))}
+            </ul>
+        ) : (
+            <div className="release-summary-reasons">
+                All platforms, installers, containers and release notes are
+                published. The release is complete.
+            </div>
+        )}
+    </div>
+);
+
 const Release = ({ data, tckResults }) => {
-    const { parent, releaseName, published, releaseNotes, dockerTags } = data;
+    const {
+        parent,
+        releaseName,
+        published,
+        releaseNotes,
+        releasePlan,
+        dockerTags,
+    } = data;
     const platforms = buildPlatforms({
         sdkBuilds: data.sdkBuilds,
         testBuilds: data.testBuilds,
@@ -497,6 +575,17 @@ const Release = ({ data, tckResults }) => {
         response: data.linuxInstallers,
     });
     const containers = summarizeContainers(data.version, dockerTags || []);
+    const source = getSourceTag(parent, releasePlan);
+    const steps = releaseNextSteps({
+        counts,
+        platforms,
+        installers,
+        linux: linuxInstallers,
+        containers,
+        releaseNotes,
+        publishedKnown: published !== null,
+        containersKnown: dockerTags !== null,
+    });
 
     return (
         <div>
@@ -512,6 +601,7 @@ const Release = ({ data, tckResults }) => {
                 >
                     Grid
                 </Link>
+                <SourceTag source={source} planKnown={releasePlan !== null} />
                 <div className="release-summary-reasons">
                     {releaseName ? (
                         <>Release: {releaseName}</>
@@ -596,6 +686,7 @@ const Release = ({ data, tckResults }) => {
                 releaseNotes={releaseNotes}
                 releaseName={releaseName}
             />
+            <NextSteps steps={steps} />
         </div>
     );
 };
