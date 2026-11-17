@@ -3,10 +3,10 @@ import {
     dedupeTestBuilds,
     dockerVersionTag,
     getReleaseName,
-    findReleasePlan,
     getSourceTag,
     normalizeReleaseName,
     parsePublishedPlatforms,
+    parseCommit,
     parseReleasePlan,
     parseReleasePlanRevisions,
     pipelineRepo,
@@ -20,6 +20,7 @@ import {
     summarizeLinuxInstallers,
     summarizePlatforms,
     summarizeReleaseNotes,
+    verifySourceTag,
     toPlatformKey,
 } from './releaseUtils';
 
@@ -460,7 +461,7 @@ jdk27uGA = 'jdk-27.0.1.1-ga'
         expect(parseReleasePlanRevisions(null)).toEqual([]);
     });
 
-    describe('findReleasePlan', () => {
+    describe('verifySourceTag', () => {
         const day = (n) => Date.parse('2026-01-01T00:00:00Z') + n * 86400000;
         // newest first
         const revisions = [
@@ -473,71 +474,124 @@ jdk27uGA = 'jdk-27.0.1.1-ga'
             r2: { jdk21u: 'jdk-21.0.13-ga', jdk17u: 'jdk-17.0.21-ga' },
             r1: { jdk21u: 'jdk-21.0.12-ga' },
         };
+        // tag -> commit, in the way of jdk-21.0.13: the -ga tag is a commit on
+        // the upstream branch and the _adopt tag merges it into the release
+        const commits = {
+            'jdk-21.0.13-ga': { sha: 'ga13', parents: ['x'] },
+            'jdk-21.0.13+9': { sha: 'ga13', parents: ['x'] },
+            'jdk-21.0.13+9_adopt': { sha: 'merge13', parents: ['rel', 'ga13'] },
+            'jdk-21.0.13.1-ga': { sha: 'ga131', parents: ['y'] },
+            'jdk-21.0.12-ga': { sha: 'ga12', parents: ['z'] },
+            'jdk-17.0.21-ga': { sha: 'ga17', parents: ['w'] },
+        };
         // not jest.fn: CRA resets mock implementations before every test
         let loaded;
+        let resolved;
         const loadPlan = async (sha) => {
             loaded.push(sha);
             return plans[sha];
         };
+        const resolveTag = async (repo, ref) => {
+            resolved.push(ref);
+            return commits[ref] || null;
+        };
         beforeEach(() => {
             loaded = [];
+            resolved = [];
         });
-
-        test('finds the revision that lists the scmReference tag', async () => {
-            const result = await findReleasePlan({
+        const verify = (args) =>
+            verifySourceTag({
                 revisions,
                 repo: 'jdk21u',
-                tag: 'jdk-21.0.13-ga',
                 startTime: day(40),
                 loadPlan,
+                resolveTag,
+                ...args,
             });
-            expect(result.status).toBe('found');
-            expect(result.revision.sha).toBe('r2');
-            expect(loaded).toEqual(['r3', 'r2']);
-        });
 
-        test('without a tag uses the newest revision before the start', async () => {
-            const result = await findReleasePlan({
-                revisions,
-                repo: 'jdk21u',
-                startTime: day(25),
-                loadPlan,
+        test('verifies the same tag without resolving the planned tag', async () => {
+            const result = await verify({ tag: 'jdk-21.0.13-ga' });
+            expect(result).toMatchObject({
+                status: 'verified',
+                relation: 'tag',
+                plannedTag: 'jdk-21.0.13-ga',
             });
             expect(result.revision.sha).toBe('r2');
-            expect(result.plan.jdk21u).toBe('jdk-21.0.13-ga');
+            expect(resolved).not.toContain('jdk-21.0.13.1-ga-extra');
         });
 
-        test('ignores revisions committed after the pipeline started', async () => {
-            const result = await findReleasePlan({
-                revisions,
-                repo: 'jdk21u',
+        test('verifies a different tag on the same commit', async () => {
+            const result = await verify({ tag: 'jdk-21.0.13+9' });
+            expect(result).toMatchObject({
+                status: 'verified',
+                relation: 'sha',
+                plannedTag: 'jdk-21.0.13-ga',
+            });
+            expect(result.revision.sha).toBe('r2');
+        });
+
+        test('verifies a _adopt merge of the planned tag', async () => {
+            const result = await verify({ tag: 'jdk-21.0.13+9_adopt' });
+            expect(result).toMatchObject({
+                status: 'verified',
+                relation: 'merge',
+                plannedTag: 'jdk-21.0.13-ga',
+            });
+            expect(result.source.sha).toBe('merge13');
+        });
+
+        test('only uses revisions from before the pipeline started', async () => {
+            const result = await verify({
+                tag: 'jdk-21.0.13+9_adopt',
+                startTime: day(15),
+            });
+            // r1 plans jdk-21.0.12-ga, which the tag does not build
+            expect(result.status).toBe('differs');
+            expect(result.plannedTag).toBe('jdk-21.0.12-ga');
+            expect(loaded).toEqual(['r1']);
+        });
+
+        test('reports the planned tag in effect when nothing matches', async () => {
+            const result = await verify({ tag: 'jdk-21.0.12-ga' });
+            // the newest revision is checked first but the older one matches
+            expect(result.status).toBe('verified');
+            expect(result.revision.sha).toBe('r1');
+            const differs = await verify({
                 tag: 'jdk-21.0.13.1-ga',
                 startTime: day(25),
-                loadPlan,
             });
-            expect(result.status).toBe('notfound');
-            expect(loaded).not.toContain('r3');
+            expect(differs.status).toBe('differs');
+            expect(differs.plannedTag).toBe('jdk-21.0.13-ga');
+            expect(differs.revision.sha).toBe('r2');
         });
 
-        test('skips revisions that do not list the repo', async () => {
-            const result = await findReleasePlan({
-                revisions,
-                repo: 'jdk17u',
-                startTime: day(40),
-                loadPlan,
-            });
+        test('is unresolved when the source tag does not exist', async () => {
+            const result = await verify({ tag: 'jdk-21.0.99-ga' });
+            expect(result).toEqual({ status: 'unresolved' });
+            expect(loaded).toEqual([]);
+        });
+
+        test('without a tag uses the newest revision that lists the repo', async () => {
+            const result = await verify({ startTime: day(25) });
+            expect(result.status).toBe('planned');
+            expect(result.plannedTag).toBe('jdk-21.0.13-ga');
             expect(result.revision.sha).toBe('r2');
+            const other = await verify({ repo: 'jdk17u', startTime: day(40) });
+            expect(other.plannedTag).toBe('jdk-17.0.21-ga');
+            expect(resolved).toEqual([]);
         });
 
-        test('is not found without a repo, and propagates read errors', async () => {
+        test('is not found without a repo or planned tag', async () => {
+            expect((await verify({ repo: null })).status).toBe('notfound');
             expect(
-                (await findReleasePlan({ revisions, repo: null, loadPlan }))
-                    .status
+                (await verify({ repo: 'jdk11u', tag: 'jdk-21.0.13-ga' })).status
             ).toBe('notfound');
+        });
+
+        test('propagates read errors', async () => {
             await expect(
-                findReleasePlan({
-                    revisions,
-                    repo: 'jdk21u',
+                verify({
+                    tag: 'jdk-21.0.13-ga',
                     loadPlan: async () => {
                         throw new Error('boom');
                     },
@@ -546,45 +600,74 @@ jdk27uGA = 'jdk-27.0.1.1-ga'
         });
     });
 
+    test('parseCommit', () => {
+        expect(
+            parseCommit({
+                sha: 'abc',
+                html_url: 'https://github.com/c/abc',
+                parents: [{ sha: 'p1' }, { sha: 'p2' }],
+            })
+        ).toEqual({
+            sha: 'abc',
+            parents: ['p1', 'p2'],
+            url: 'https://github.com/c/abc',
+        });
+        expect(parseCommit({ message: 'Not Found' })).toBeNull();
+        expect(parseCommit(null)).toBeNull();
+    });
+
     describe('getSourceTag', () => {
         const pipeline = (value) => ({
             buildName: 'release-openjdk21-pipeline',
             buildParams: value ? [{ name: 'scmReference', value }] : [],
         });
         const revision = { sha: 'r2', time: 1, url: 'https://github.com/c/r2' };
-        const found = {
-            status: 'found',
+        const source = { sha: 'merge13', parents: ['rel', 'ga13'] };
+        const verified = {
+            status: 'verified',
+            relation: 'merge',
             revision,
-            plan: { jdk21u: 'jdk-21.0.13-ga' },
+            plannedTag: 'jdk-21.0.13-ga',
+            source,
         };
 
-        test('uses the scmReference parameter and the matching revision', () => {
-            expect(getSourceTag(pipeline('jdk-21.0.13-ga'), found)).toEqual({
-                tag: 'jdk-21.0.13-ga',
+        test('uses the scmReference parameter and the verification', () => {
+            expect(
+                getSourceTag(pipeline('jdk-21.0.13+9_adopt'), verified)
+            ).toEqual({
+                tag: 'jdk-21.0.13+9_adopt',
                 repo: 'jdk21u',
                 fromPlan: false,
+                status: 'verified',
+                relation: 'merge',
                 revision,
-                planStatus: 'found',
-                url: 'https://github.com/adoptium/jdk21u/releases/tag/jdk-21.0.13-ga',
+                plannedTag: 'jdk-21.0.13-ga',
+                commit: source,
+                url: 'https://github.com/adoptium/jdk21u/releases/tag/jdk-21.0.13%2B9_adopt',
             });
         });
 
-        test('keeps the tag when no revision lists it', () => {
-            const source = getSourceTag(pipeline('jdk-21.0.99-ga'), {
-                status: 'notfound',
-            });
+        test('keeps the tag when the check could not be done', () => {
+            const source = getSourceTag(pipeline('jdk-21.0.99-ga'), null);
             expect(source.tag).toBe('jdk-21.0.99-ga');
-            expect(source.planStatus).toBe('notfound');
+            expect(source.status).toBe('unavailable');
             expect(source.revision).toBeNull();
             expect(
-                getSourceTag(pipeline('jdk-21.0.99-ga'), null).planStatus
-            ).toBe('unavailable');
+                getSourceTag(pipeline('jdk-21.0.99-ga'), {
+                    status: 'unresolved',
+                }).status
+            ).toBe('unresolved');
         });
 
         test('falls back to the tag planned in the revision', () => {
-            const source = getSourceTag(pipeline(''), found);
-            expect(source.tag).toBe('jdk-21.0.13-ga');
-            expect(source.fromPlan).toBe(true);
+            const planned = {
+                status: 'planned',
+                revision,
+                plannedTag: 'jdk-21.0.13-ga',
+            };
+            const result = getSourceTag(pipeline(''), planned);
+            expect(result.tag).toBe('jdk-21.0.13-ga');
+            expect(result.fromPlan).toBe(true);
             expect(getSourceTag(pipeline(''), null)).toBeNull();
             expect(
                 getSourceTag(pipeline(''), { status: 'notfound' })

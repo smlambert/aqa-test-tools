@@ -27,16 +27,18 @@ import {
     RELEASE_PLAN_COMMITS_URL,
     buildPlatforms,
     dockerVersionTag,
-    findReleasePlan,
     getReleaseName,
     getSourceTag,
+    githubCommitUrl,
     parsePublishedPlatforms,
+    parseCommit,
     parseReleasePlan,
     parseReleasePlanRevisions,
     paramValue,
     pipelineRepo,
     releaseNextSteps,
     releasePlanUrl,
+    verifySourceTag,
     summarizeContainers,
     summarizeInstallers,
     summarizeLinuxInstallers,
@@ -137,16 +139,43 @@ const loadPlan = (sha) => {
     return planCache.get(sha);
 };
 
-// Finds the releasePlan.cfg revision that relates to the pipeline. Returns
-// null when the file history cannot be read.
+// Resolves a tag (or branch) of an adoptium repo to its commit and parents.
+// Returns null when it does not exist. A tag does not move, so it is cached.
+const commitCache = new Map();
+
+const resolveTag = (repo, ref) => {
+    const key = `${repo}/${ref}`;
+    if (!commitCache.has(key)) {
+        const promise = fetch(githubCommitUrl(repo, ref)).then(
+            async (response) => {
+                // 404 or 422: no commit for this ref
+                if (response.status === 404 || response.status === 422) {
+                    return null;
+                }
+                if (!response.ok) {
+                    throw new Error(`commit ${ref}: HTTP ${response.status}`);
+                }
+                return parseCommit(await response.json());
+            }
+        );
+        commitCache.set(key, promise);
+        promise.catch(() => commitCache.delete(key));
+    }
+    return commitCache.get(key);
+};
+
+// Checks the pipeline's source tag against the -ga tag in the releasePlan.cfg
+// revision that relates to it. Returns null when releasePlan.cfg or GitHub
+// cannot be read.
 const fetchReleasePlan = async (parent) => {
     try {
-        return await findReleasePlan({
+        return await verifySourceTag({
             revisions: await getRevisions(),
             repo: pipelineRepo(parent.buildName),
             tag: (paramValue(parent, 'scmReference') || '').trim(),
             startTime: parent.timestamp,
             loadPlan,
+            resolveTag,
         });
     } catch (e) {
         console.error(e);
@@ -543,30 +572,70 @@ const ReleaseNotes = ({ releaseNotes, releaseName }) => (
     </div>
 );
 
-const PlanRevision = ({ source }) => {
-    const { revision, planStatus, fromPlan } = source;
-    if (planStatus === 'found') {
+const RELATIONS = {
+    tag: 'the same tag as',
+    sha: 'the same commit as',
+    merge: 'a merge of',
+};
+
+const PlanRevisionLink = ({ revision }) => (
+    <>
+        releasePlan.cfg{' '}
+        <a href={revision.url} target="_blank" rel="noreferrer">
+            {revision.sha.slice(0, 7)}
+        </a>{' '}
+        ({moment(revision.time).format('MMM DD YYYY')})
+    </>
+);
+
+const PlanCheck = ({ source }) => {
+    const { status, revision, plannedTag, relation, commit, repo } = source;
+    const tagStyle = { marginLeft: 8 };
+    if (status === 'verified') {
         return (
-            <>
-                {' | '}
-                {fromPlan ? 'planned in' : 'listed in'} releasePlan.cfg{' '}
-                <a href={revision.url} target="_blank" rel="noreferrer">
-                    {revision.sha.slice(0, 7)}
-                </a>{' '}
-                ({moment(revision.time).format('MMM DD YYYY')})
-            </>
+            <div>
+                <Tag color="success" icon={<CheckCircleOutlined />}>
+                    Matches planned {plannedTag}
+                </Tag>
+                {commit && `commit ${commit.sha.slice(0, 7)} is `}
+                {RELATIONS[relation]} {plannedTag} in{' '}
+                <PlanRevisionLink revision={revision} />
+            </div>
         );
     }
-    if (planStatus === 'notfound') {
+    if (status === 'differs') {
         return (
-            <Tag style={{ marginLeft: 8 }}>
-                Not found in recent releasePlan.cfg revisions
+            <div>
+                <Tag color="warning" icon={<ExclamationCircleOutlined />}>
+                    Does not match planned {plannedTag}
+                </Tag>
+                {commit && `commit ${commit.sha.slice(0, 7)} | `}
+                planned in <PlanRevisionLink revision={revision} />
+            </div>
+        );
+    }
+    if (status === 'planned') {
+        return (
+            <div>
+                planned in <PlanRevisionLink revision={revision} />
+            </div>
+        );
+    }
+    if (status === 'unresolved') {
+        return (
+            <Tag color="warning" style={tagStyle}>
+                Tag not found in adoptium/{repo}
             </Tag>
         );
     }
-    return (
-        <Tag style={{ marginLeft: 8 }}>releasePlan.cfg history unavailable</Tag>
-    );
+    if (status === 'notfound') {
+        return (
+            <Tag style={tagStyle}>
+                No planned tag in recent releasePlan.cfg revisions
+            </Tag>
+        );
+    }
+    return <Tag style={tagStyle}>releasePlan.cfg check unavailable</Tag>;
 };
 
 const SourceTag = ({ source }) => {
@@ -588,7 +657,7 @@ const SourceTag = ({ source }) => {
                 source.tag
             )}
             {source.repo && ` (adoptium/${source.repo})`}
-            <PlanRevision source={source} />
+            <PlanCheck source={source} />
         </div>
     );
 };

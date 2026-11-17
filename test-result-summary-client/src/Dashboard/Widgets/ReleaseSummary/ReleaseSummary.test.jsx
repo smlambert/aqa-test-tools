@@ -83,6 +83,20 @@ const routes = {
 
 let notesResponse;
 
+// jdk21u commits by tag: the -ga tag, and an _adopt tag that merges it
+const githubCommits = {
+    'jdk-21.0.13.1-ga': { sha: 'ga131', parents: [{ sha: 'x' }] },
+    'jdk-21.0.13.1+1_adopt': {
+        sha: 'merge131',
+        html_url: 'https://github.com/adoptium/jdk21u/commit/merge131',
+        parents: [{ sha: 'rel' }, { sha: 'ga131' }],
+    },
+    'jdk-21.0.12+7_adopt': {
+        sha: 'merge12',
+        parents: [{ sha: 'rel' }, { sha: 'ga12' }],
+    },
+};
+
 const planCommit = (sha, date) => ({
     sha,
     html_url: `https://github.com/adoptium/mirror-scripts/commit/${sha}`,
@@ -106,7 +120,14 @@ beforeEach(() => {
         if (url.includes('/info/release_notes/')) {
             return notesResponse;
         }
-        if (url.includes('api.github.com') && url.includes('/commits')) {
+        const commitRef = /repos\/adoptium\/jdk21u\/commits\/(.+)$/.exec(url);
+        if (commitRef) {
+            const commit = githubCommits[decodeURIComponent(commitRef[1])];
+            return commit
+                ? { status: 200, ok: true, json: async () => commit }
+                : { status: 422, ok: false, json: async () => ({}) };
+        }
+        if (url.includes('/mirror-scripts/commits')) {
             return {
                 status: 200,
                 ok: true,
@@ -211,6 +232,54 @@ test('renders summary for the selected pipeline', async () => {
         fetchData.mock.calls.some(([u]) => u.includes('getBuildHistory'))
     ).toBe(true);
 
+    await act(async () => root.unmount());
+});
+
+const originalParams = routes['/api/getData'][0].buildParams;
+afterEach(() => {
+    routes['/api/getData'][0].buildParams = originalParams;
+});
+
+const renderWithTag = async (scmReference) => {
+    const parent = routes['/api/getData'][0];
+    parent.buildParams = [
+        { name: 'overridePublishName', value: 'jdk-21.0.5+11' },
+        { name: 'scmReference', value: scmReference },
+    ];
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+        root.render(
+            <ReleaseSummary pipelineSelected="p1" onChange={jest.fn()} />
+        );
+    });
+    await flush();
+    await flush();
+    return { container, root };
+};
+
+test('verifies the source tag against the planned -ga tag by commit', async () => {
+    const { container, root } = await renderWithTag('jdk-21.0.13.1+1_adopt');
+    const text = container.textContent;
+    expect(text).toContain('Building source tag: jdk-21.0.13.1+1_adopt');
+    expect(text).toContain('Matches planned jdk-21.0.13.1-ga');
+    expect(text).toContain('commit merge13 is a merge of jdk-21.0.13.1-ga');
+    expect(text).toContain('releasePlan.cfg abcdef1');
+    await act(async () => root.unmount());
+});
+
+test('warns when the source tag is not the planned tag', async () => {
+    const { container, root } = await renderWithTag('jdk-21.0.12+7_adopt');
+    const text = container.textContent;
+    expect(text).toContain('Does not match planned jdk-21.0.13.1-ga');
+    expect(text).not.toContain('Matches planned');
+    await act(async () => root.unmount());
+});
+
+test('reports a source tag that does not exist', async () => {
+    const { container, root } = await renderWithTag('jdk-21.0.99-ga');
+    expect(container.textContent).toContain('Tag not found in adoptium/jdk21u');
     await act(async () => root.unmount());
 });
 

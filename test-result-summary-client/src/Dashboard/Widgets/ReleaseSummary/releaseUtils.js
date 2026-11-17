@@ -551,63 +551,124 @@ export const parseReleasePlanRevisions = (commits) =>
 // Revisions to look at in a lookup, so that an old or manually set tag does
 // not cause a request for every revision in the history
 const MAX_REVISIONS = 15;
+// GitHub limits unauthenticated API requests, so only a few distinct planned
+// tags are resolved to commits in one lookup
+const MAX_TAG_LOOKUPS = 5;
+
+export const githubCommitUrl = (repo, ref) =>
+    `https://api.github.com/repos/adoptium/${repo}/commits/${encodeURIComponent(
+        ref
+    )}`;
+
+export const githubTagUrl = (repo, tag) =>
+    `https://github.com/adoptium/${repo}/releases/tag/${encodeURIComponent(
+        tag
+    )}`;
+
+// GitHub commit API response -> { sha, parents: [sha], url }
+export const parseCommit = (commit) =>
+    commit && commit.sha
+        ? {
+              sha: commit.sha,
+              parents: (commit.parents || []).map((p) => p.sha),
+              url: commit.html_url,
+          }
+        : null;
 
 /**
- * Find the releasePlan.cfg revision that relates to a pipeline.
+ * Check the source tag of a pipeline against the -ga tag in releasePlan.cfg.
  *
- * The pipeline used a revision that was committed before it started, so only
- * those are searched, newest first. With a tag (the pipeline's scmReference),
- * the first revision that lists it for the repo is the match. Without one, the
- * newest revision that lists the repo is the one in effect.
+ * The tags are compared by commit, not by name: the pipeline usually builds
+ * a tag such as jdk-21.0.5+11_adopt, which is a merge into the release branch
+ * whose parent is the commit that the upstream jdk-21.0.5-ga tag points to.
+ * The source tag matches a planned tag when it is that tag, points to the
+ * same commit, or is a merge commit with that commit as a parent.
  *
- * loadPlan(sha) returns the parsed plan of a revision and throws when it
- * cannot be read. Returns { status: 'found', revision, plan } or
- * { status: 'notfound' }.
+ * Only releasePlan.cfg revisions committed before the pipeline started are
+ * searched, newest first. loadPlan(sha) returns the parsed plan of a revision
+ * and resolveTag(repo, ref) returns { sha, parents } or null when the ref
+ * does not exist. Both throw when they cannot be read.
+ *
+ * Returns { status } where status is one of:
+ *   verified   - a planned tag matches (relation: tag, sha or merge)
+ *   differs    - the tag planned when the pipeline started does not match
+ *   planned    - no tag given, plannedTag is the one planned when it started
+ *   unresolved - the source tag does not exist in the repo
+ *   notfound   - no revision plans a tag for the repo
  */
-export const findReleasePlan = async ({
+export const verifySourceTag = async ({
     revisions = [],
     repo,
     tag,
     startTime,
     loadPlan,
+    resolveTag,
 }) => {
     if (!repo) return { status: 'notfound' };
+    const source = tag ? await resolveTag(repo, tag) : null;
+    if (tag && !source) return { status: 'unresolved' };
+
     const candidates = revisions
         .filter((r) => !startTime || r.time <= startTime)
         .slice(0, MAX_REVISIONS);
+    const checked = new Set();
+    let inEffect = null;
     for (const revision of candidates) {
-        const plan = await loadPlan(revision.sha);
-        if (tag ? plan[repo] === tag : plan[repo]) {
-            return { status: 'found', revision, plan };
+        const plannedTag = (await loadPlan(revision.sha))[repo];
+        if (!plannedTag) continue;
+        if (!tag) return { status: 'planned', revision, plannedTag };
+        inEffect = inEffect || { revision, plannedTag };
+        if (checked.has(plannedTag)) continue;
+        checked.add(plannedTag);
+
+        let relation = plannedTag === tag ? 'tag' : null;
+        if (!relation) {
+            const planned = await resolveTag(repo, plannedTag);
+            if (planned && planned.sha === source.sha) relation = 'sha';
+            else if (planned && source.parents.includes(planned.sha)) {
+                relation = 'merge';
+            }
         }
+        if (relation) {
+            return {
+                status: 'verified',
+                relation,
+                revision,
+                plannedTag,
+                source,
+            };
+        }
+        if (checked.size >= MAX_TAG_LOOKUPS) break;
     }
-    return { status: 'notfound' };
+    return inEffect
+        ? { status: 'differs', ...inEffect, source }
+        : { status: 'notfound' };
 };
 
 /**
- * The tag the pipeline is building, from its scmReference parameter. Without
- * one, the tag planned in the releasePlan.cfg revision in effect when the
- * pipeline started is used. lookup is the findReleasePlan result, or null
- * when the file history could not be read.
+ * The tag the pipeline is building, from its scmReference parameter, with the
+ * verifySourceTag result. Without an scmReference, the tag planned in the
+ * releasePlan.cfg revision in effect when the pipeline started is used.
+ * lookup is null when releasePlan.cfg or GitHub could not be read.
  */
 export const getSourceTag = (parent, lookup) => {
     const repo = pipelineRepo(parent && parent.buildName);
     const param = (paramValue(parent, 'scmReference') || '').trim();
-    const found = lookup && lookup.status === 'found' ? lookup : null;
-    const tag = param || (found && found.plan[repo]) || null;
+    const tag =
+        param ||
+        (lookup && lookup.status === 'planned' ? lookup.plannedTag : null);
     if (!tag) return null;
     return {
         tag,
         repo,
         fromPlan: !param,
-        revision: found ? found.revision : null,
-        // found, notfound or unavailable
-        planStatus: lookup ? lookup.status : 'unavailable',
-        url: repo
-            ? `https://github.com/adoptium/${repo}/releases/tag/${encodeURIComponent(
-                  tag
-              )}`
-            : null,
+        // verified, differs, planned, unresolved, notfound or unavailable
+        status: lookup ? lookup.status : 'unavailable',
+        relation: (lookup && lookup.relation) || null,
+        revision: (lookup && lookup.revision) || null,
+        plannedTag: (lookup && lookup.plannedTag) || null,
+        commit: (lookup && lookup.source) || null,
+        url: repo ? githubTagUrl(repo, tag) : null,
     };
 };
 
