@@ -25,6 +25,7 @@ import { params } from '../../../utils/query';
 import {
     PIPELINE_REGEX,
     RELEASE_PLAN_COMMITS_URL,
+    aqaIssuesUrl,
     buildPlatforms,
     dockerVersionTag,
     getReleaseName,
@@ -36,8 +37,10 @@ import {
     parseReleasePlanRevisions,
     paramValue,
     pipelineRepo,
+    pipelineVersion,
     releaseNextSteps,
     releasePlanUrl,
+    selectAqaRelease,
     verifySourceTag,
     summarizeContainers,
     summarizeInstallers,
@@ -183,6 +186,43 @@ const fetchReleasePlan = async (parent) => {
     }
 };
 
+// The aqa-tests issues of a JDK version are listed in one request and cached,
+// as GitHub limits unauthenticated API requests (60 per hour)
+const aqaIssuesCache = new Map();
+
+const getAqaIssues = (version) => {
+    const cached = aqaIssuesCache.get(version);
+    if (!cached || Date.now() - cached.at > REFRESH_MS) {
+        const promise = fetchJson(
+            aqaIssuesUrl(version),
+            'aqa-tests issues'
+        ).then((r) => r.json());
+        aqaIssuesCache.set(version, { at: Date.now(), promise });
+        promise.catch(() => {
+            const entry = aqaIssuesCache.get(version);
+            if (entry && entry.promise === promise) {
+                aqaIssuesCache.delete(version);
+            }
+        });
+    }
+    return aqaIssuesCache.get(version).promise;
+};
+
+// The AQAvit release issue of the pipeline and its per-platform triage
+// issues. Returns { parent: null } when there is no issue for the pipeline and
+// null when GitHub cannot be reached.
+const fetchAqaRelease = async (parent) => {
+    const version = pipelineVersion(parent.buildName);
+    if (!version) return null;
+    try {
+        const found = selectAqaRelease(await getAqaIssues(version), parent);
+        return found || { parent: null, triage: {} };
+    } catch (e) {
+        console.error(e);
+        return null;
+    }
+};
+
 const fetchTckResults = async (jckBuilds) => {
     const results = [];
     await Promise.all(
@@ -274,11 +314,12 @@ const loadRelease = async (parentId) => {
     const sdk = asList(sdkBuilds);
     const tests = asList(testBuilds);
     const releaseName = getReleaseName(parent, [...sdk, ...tests]);
-    const [published, releaseNotes, releasePlan, linuxInstallers] =
+    const [published, releaseNotes, releasePlan, aqaRelease, linuxInstallers] =
         await Promise.all([
             fetchPublished(releaseName),
             fetchReleaseNotes(releaseName),
             fetchReleasePlan(parent),
+            fetchAqaRelease(parent),
             releaseName
                 ? fetchData(
                       `/api/getLinuxInstallerBuilds?tag=${encodeURIComponent(
@@ -303,6 +344,7 @@ const loadRelease = async (parentId) => {
         published,
         releaseNotes,
         releasePlan,
+        aqaRelease,
         linuxInstallers,
         dockerTags: docker && Array.isArray(docker.tags) ? docker.tags : null,
     };
@@ -346,6 +388,26 @@ const PlatformItem = ({ platform, showFailures }) => (
             {platform.reasons.length > 0 && (
                 <div className="release-summary-reasons">
                     {platform.reasons.join('; ')}
+                </div>
+            )}
+            {platform.triageIssue && (
+                <div className="release-summary-reasons">
+                    <a
+                        href={platform.triageIssue.url}
+                        target="_blank"
+                        rel="noreferrer"
+                    >
+                        Triage issue #{platform.triageIssue.number}
+                    </a>{' '}
+                    <Tag
+                        color={
+                            platform.triageIssue.state === 'closed'
+                                ? 'success'
+                                : 'warning'
+                        }
+                    >
+                        {platform.triageIssue.state}
+                    </Tag>
                 </div>
             )}
             {showFailures && (
@@ -662,6 +724,38 @@ const SourceTag = ({ source }) => {
     );
 };
 
+const AqaIssues = ({ aqaRelease, platforms }) => {
+    const title = 'AQAvit release issue';
+    if (!aqaRelease) {
+        return (
+            <div className="release-summary-reasons">
+                {title}: aqa-tests issues unavailable (GitHub could not be
+                reached)
+            </div>
+        );
+    }
+    if (!aqaRelease.parent) {
+        return (
+            <div className="release-summary-reasons">
+                {title}: no aqa-tests release issue found for this pipeline
+            </div>
+        );
+    }
+    const { parent, matchedBy } = aqaRelease;
+    const issues = platforms.filter((p) => p.triageIssue);
+    const closed = issues.filter((p) => p.triageIssue.state === 'closed');
+    return (
+        <div className="release-summary-reasons">
+            {title}:{' '}
+            <a href={parent.url} target="_blank" rel="noreferrer">
+                {parent.title}
+            </a>{' '}
+            | {closed.length}/{issues.length} triage issue(s) closed
+            {matchedBy === 'date' && ' (matched by version and date)'}
+        </div>
+    );
+};
+
 const NextSteps = ({ steps }) => (
     <div className="release-summary-section">
         <div className="release-summary-section-title">
@@ -689,6 +783,7 @@ const Release = ({ data, tckResults }) => {
         published,
         releaseNotes,
         releasePlan,
+        aqaRelease,
         dockerTags,
     } = data;
     const platforms = buildPlatforms({
@@ -696,6 +791,7 @@ const Release = ({ data, tckResults }) => {
         testBuilds: data.testBuilds,
         tckResults,
         published: published || {},
+        triageIssues: (aqaRelease && aqaRelease.triage) || {},
     });
     const counts = summarizePlatforms(platforms);
     const by = (state) => platforms.filter((p) => p.state === state);
@@ -737,6 +833,7 @@ const Release = ({ data, tckResults }) => {
                     Grid
                 </Link>
                 <SourceTag source={source} />
+                <AqaIssues aqaRelease={aqaRelease} platforms={platforms} />
                 <div className="release-summary-reasons">
                     {releaseName ? (
                         <>Release: {releaseName}</>

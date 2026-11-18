@@ -82,6 +82,17 @@ const routes = {
 };
 
 let notesResponse;
+// aqa-tests issues returned by the GitHub issues API, or null when it fails
+let aqaIssues;
+
+const aqaIssue = (number, title, extra = {}) => ({
+    number,
+    title,
+    html_url: `https://github.com/adoptium/aqa-tests/issues/${number}`,
+    state: 'open',
+    body: '',
+    ...extra,
+});
 
 // jdk21u commits by tag: the -ga tag, and an _adopt tag that merges it
 const githubCommits = {
@@ -103,7 +114,14 @@ const planCommit = (sha, date) => ({
     commit: { committer: { date } },
 });
 
+// the issues are cached for 5 minutes, so every test moves the clock forward
+const realNow = Date.now();
+let clock = 0;
+
 beforeEach(() => {
+    clock += 60 * 60 * 1000;
+    jest.spyOn(Date, 'now').mockImplementation(() => realNow + clock);
+    aqaIssues = [];
     notesResponse = {
         status: 200,
         ok: true,
@@ -119,6 +137,11 @@ beforeEach(() => {
     global.fetch = jest.fn(async (url) => {
         if (url.includes('/info/release_notes/')) {
             return notesResponse;
+        }
+        if (url.includes('repos/adoptium/aqa-tests/issues')) {
+            return aqaIssues
+                ? { status: 200, ok: true, json: async () => aqaIssues }
+                : { status: 403, ok: false, json: async () => ({}) };
         }
         const commitRef = /repos\/adoptium\/jdk21u\/commits\/(.+)$/.exec(url);
         if (commitRef) {
@@ -311,5 +334,81 @@ test('shows a prompt when nothing is selected', async () => {
     expect(container.textContent).toContain(
         'Select a release pipeline to see its summary'
     );
+    await act(async () => root.unmount());
+});
+
+const renderSelected = async () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+        root.render(
+            <ReleaseSummary pipelineSelected="p1" onChange={jest.fn()} />
+        );
+    });
+    await flush();
+    await flush();
+    return { container, root };
+};
+
+const parentIssue = aqaIssue(
+    100,
+    'November 2026 Release AQAvit Activities - JDK21',
+    {
+        body: 'Pipeline URL: https://ci.adoptium.net/job/build-scripts/job/release-openjdk21-pipeline/7/\nVersion: JDK21',
+    }
+);
+
+test('a closed triage issue moves the platform to ready to publish', async () => {
+    aqaIssues = [
+        parentIssue,
+        aqaIssue(
+            101,
+            'Triage Automated Tests for November 2026 JDK21 - aarch64_linux',
+            { state: 'closed' }
+        ),
+    ];
+    const { container, root } = await renderSelected();
+    const text = container.textContent;
+    expect(text).toContain('Platforms Requiring Triage (0)');
+    expect(text).toContain('Platforms Ready to Publish (1)');
+    expect(text).toContain('1/1 triage issue(s) closed');
+    expect(
+        container.querySelector('a[href$="/aqa-tests/issues/100"]')
+    ).not.toBeNull();
+    await act(async () => root.unmount());
+});
+
+test('an open triage issue keeps the platform in triage', async () => {
+    aqaIssues = [
+        parentIssue,
+        aqaIssue(
+            101,
+            'Triage Automated Tests for November 2026 JDK21 - aarch64_linux'
+        ),
+    ];
+    const { container, root } = await renderSelected();
+    const text = container.textContent;
+    expect(text).toContain('Platforms Requiring Triage (1)');
+    expect(text).toContain('0/1 triage issue(s) closed');
+    expect(text).toContain('aarch64 Linux (issue #101)');
+    await act(async () => root.unmount());
+});
+
+test('reports when there is no aqa-tests release issue', async () => {
+    const { container, root } = await renderSelected();
+    expect(container.textContent).toContain(
+        'no aqa-tests release issue found for this pipeline'
+    );
+    expect(container.textContent).toContain('Platforms Requiring Triage (1)');
+    await act(async () => root.unmount());
+});
+
+test('still renders when the aqa-tests issues cannot be read', async () => {
+    aqaIssues = null;
+    const { container, root } = await renderSelected();
+    const text = container.textContent;
+    expect(text).toContain('aqa-tests issues unavailable');
+    expect(text).toContain('Platforms Published (2)');
     await act(async () => root.unmount());
 });

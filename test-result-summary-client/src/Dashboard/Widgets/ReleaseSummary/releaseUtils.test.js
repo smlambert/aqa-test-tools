@@ -11,8 +11,11 @@ import {
     parseReleasePlanRevisions,
     pipelineRepo,
     releaseNextSteps,
+    parseAqaIssues,
     parseSdkBuildName,
     parseTestBuildName,
+    pipelineVersion,
+    selectAqaRelease,
     releaseNameFromJavaVersion,
     summarizeContainers,
     linuxInstallerPlatform,
@@ -171,6 +174,190 @@ describe('buildPlatforms', () => {
         });
         expect(p.aqa).toMatchObject({ total: 2, passed: 1, failed: 1 });
         expect(p.state).toBe('triage');
+    });
+});
+
+describe('triage issues', () => {
+    const sdkBuilds = [
+        build('jdk21u-linux-x64-temurin'),
+        build('jdk21u-linux-aarch64-temurin', 'FAILURE'),
+        build('jdk21u-mac-x64-temurin'),
+        build('jdk21u-aix-ppc64-temurin'),
+    ];
+    const t = (platform, result = 'SUCCESS', extra) =>
+        build(`Test_openjdk21_hs_sanity.functional_${platform}`, result, extra);
+    const testBuilds = [
+        t('x86-64_linux'),
+        t('aarch64_linux', 'FAILURE'),
+        t('x86-64_mac'),
+        t('ppc64_aix', null, { status: 'NotDone' }),
+    ];
+    const issue = (number, state) => ({ number, state, url: `u/${number}` });
+    const state = (platforms) =>
+        Object.fromEntries(platforms.map((p) => [p.key, p.state]));
+
+    test('a closed triage issue moves a failed platform to ready', () => {
+        const platforms = buildPlatforms({
+            sdkBuilds,
+            testBuilds,
+            triageIssues: { aarch64_linux: issue(5, 'closed') },
+        });
+        expect(state(platforms).aarch64_linux).toBe('ready');
+        const p = platforms.find((x) => x.key === 'aarch64_linux');
+        expect(p.triaged).toBe(true);
+        expect(p.reasons[0]).toMatch(/Triage issue #5 closed/);
+        expect(p.reasons[0]).toMatch(/AQA build\(s\) failed/);
+    });
+
+    test('an open triage issue keeps a failed platform in triage', () => {
+        const platforms = buildPlatforms({
+            sdkBuilds,
+            testBuilds,
+            triageIssues: { aarch64_linux: issue(5, 'open') },
+        });
+        const p = platforms.find((x) => x.key === 'aarch64_linux');
+        expect(p.state).toBe('triage');
+        expect(p.triageIssue.number).toBe(5);
+    });
+
+    test('issues do not change published or in-progress platforms', () => {
+        const platforms = buildPlatforms({
+            sdkBuilds,
+            testBuilds,
+            published: { x64_linux: {} },
+            triageIssues: {
+                x64_linux: issue(1, 'closed'),
+                ppc64_aix: issue(2, 'closed'),
+            },
+        });
+        expect(state(platforms)).toMatchObject({
+            x64_linux: 'published',
+            ppc64_aix: 'inprogress',
+            x64_mac: 'ready',
+        });
+    });
+
+    test('notes an open issue on a passing platform', () => {
+        const platforms = buildPlatforms({
+            sdkBuilds,
+            testBuilds,
+            triageIssues: { x64_mac: issue(3, 'open') },
+        });
+        const p = platforms.find((x) => x.key === 'x64_mac');
+        expect(p.state).toBe('ready');
+        expect(p.reasons).toEqual(['Triage issue #3 is still open']);
+    });
+
+    const parentBody = (url) =>
+        `Pipeline URL: ${url}\nnotes\nVersion: JDK21\n### Primary Tasks`;
+    const gh = (number, title, extra = {}) => ({
+        number,
+        title,
+        html_url: `https://github.com/adoptium/aqa-tests/issues/${number}`,
+        state: 'open',
+        body: '',
+        ...extra,
+    });
+    const issues = [
+        gh(100, 'November 2026 Release AQAvit Activities - JDK21', {
+            body: parentBody(
+                'https://ci.adoptium.net/job/build-scripts/job/release-openjdk21-pipeline/7/'
+            ),
+        }),
+        gh(90, 'October 2026 Release AQAvit Activities - JDK21', {
+            body: parentBody(''),
+        }),
+        gh(
+            101,
+            'Triage Automated Tests for November 2026 JDK21 - x86-64_linux',
+            { state: 'closed', closed_at: '2026-11-05T00:00:00Z' }
+        ),
+        gh(
+            102,
+            'Triage Automated Tests for November 2026 JDK21 - aarch64_alpine-linux'
+        ),
+        gh(91, 'Triage Automated Tests for October 2026 JDK21 - x86-64_linux'),
+        gh(
+            103,
+            'Dry-run: Triage Automated Tests for November 2026 JDK21 - x86-64_mac'
+        ),
+        gh(104, 'Some other issue'),
+        gh(105, 'pull', { pull_request: {} }),
+    ];
+
+    test('parses parent and triage issues', () => {
+        const { parents, triage } = parseAqaIssues(issues);
+        expect(parents.map((p) => p.number)).toEqual([100, 90]);
+        expect(parents[0]).toMatchObject({
+            month: 'November 2026',
+            version: '21',
+            dryRun: false,
+        });
+        expect(parents[0].pipelineUrl).toMatch(/release-openjdk21-pipeline\/7/);
+        expect(triage.map((i) => [i.number, i.key, i.state, i.dryRun])).toEqual(
+            [
+                [101, 'x64_linux', 'closed', false],
+                [102, 'aarch64_alpine-linux', 'open', false],
+                [91, 'x64_linux', 'open', false],
+                [103, 'x64_mac', 'open', true],
+            ]
+        );
+        expect(parseAqaIssues(null)).toEqual({ parents: [], triage: [] });
+    });
+
+    test('pipelineVersion', () => {
+        expect(pipelineVersion('release-openjdk21-pipeline')).toBe('21');
+        expect(pipelineVersion('release-openjdk8u-pipeline')).toBe('8');
+        expect(pipelineVersion('other')).toBeNull();
+    });
+
+    test('selects the parent by Pipeline URL', () => {
+        const found = selectAqaRelease(issues, {
+            buildName: 'release-openjdk21-pipeline',
+            buildNum: 7,
+            timestamp: Date.parse('2026-10-01T00:00:00Z'),
+        });
+        expect(found.matchedBy).toBe('pipeline');
+        expect(found.parent.number).toBe(100);
+        // only the triage issues of the same month and release
+        expect(Object.keys(found.triage).sort()).toEqual([
+            'aarch64_alpine-linux',
+            'x64_linux',
+        ]);
+        expect(found.triage.x64_linux.number).toBe(101);
+    });
+
+    test('falls back to the closest month of the version', () => {
+        const pipeline = {
+            buildName: 'release-openjdk21-pipeline',
+            buildNum: 8,
+            timestamp: Date.parse('2026-10-28T00:00:00Z'),
+        };
+        // October and November are both within a month of the start
+        expect(selectAqaRelease(issues, pipeline).parent.number).toBe(90);
+        const found = selectAqaRelease(issues, {
+            ...pipeline,
+            timestamp: Date.parse('2026-11-10T00:00:00Z'),
+        });
+        expect(found.matchedBy).toBe('date');
+        expect(found.parent.number).toBe(100);
+        expect(found.triage.x64_linux.number).toBe(101);
+    });
+
+    test('returns null without a matching parent issue', () => {
+        const pipeline = {
+            buildName: 'release-openjdk21-pipeline',
+            buildNum: 9,
+            timestamp: Date.parse('2027-06-01T00:00:00Z'),
+        };
+        expect(selectAqaRelease(issues, pipeline)).toBeNull();
+        expect(
+            selectAqaRelease(issues, {
+                ...pipeline,
+                buildName: 'release-openjdk17-pipeline',
+            })
+        ).toBeNull();
+        expect(selectAqaRelease([], pipeline)).toBeNull();
     });
 });
 
@@ -725,6 +912,24 @@ describe('releaseNextSteps', () => {
             'Publish the Linux packages (RPM/DEB/APK) for aarch64 Linux',
             'Publish the container images on Docker Hub',
             'Publish the release notes',
+        ]);
+    });
+
+    test('names the triage issues', () => {
+        const steps = releaseNextSteps({
+            ...done,
+            counts: { inprogress: 0, triage: 2, ready: 0 },
+            platforms: [
+                {
+                    label: 'x64 Mac',
+                    state: 'triage',
+                    triageIssue: { number: 7 },
+                },
+                { label: 'x64 Linux', state: 'triage' },
+            ],
+        });
+        expect(steps).toEqual([
+            'Triage the failures on 2 platform(s): x64 Mac (issue #7), x64 Linux',
         ]);
     });
 

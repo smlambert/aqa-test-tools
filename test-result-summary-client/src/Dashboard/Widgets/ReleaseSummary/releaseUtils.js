@@ -112,12 +112,14 @@ export const dedupeTestBuilds = (testBuilds = []) => {
  *   triage     - JDK build, AQA or TCK has a failure
  *   inprogress - build or tests still running (or no tests yet)
  *   ready      - JDK build and all AQA passed, not yet published
+ *                (or the failures were triaged: the triage issue is closed)
  */
 export const buildPlatforms = ({
     sdkBuilds = [],
     testBuilds = [],
     tckResults = [],
     published = {},
+    triageIssues = {},
 }) => {
     const platforms = {};
     const ensure = (key) => {
@@ -219,11 +221,27 @@ export const buildPlatforms = ({
             state = 'ready';
         }
 
+        // A closed triage issue means the failures have been triaged
+        const issue = triageIssues[platform.key] || null;
+        let triaged = false;
+        if (state === 'triage' && issue && issue.state === 'closed') {
+            state = 'ready';
+            triaged = true;
+            const failures = reasons.splice(0, reasons.length);
+            reasons.push(
+                `Triage issue #${issue.number} closed (${failures.join(', ')})`
+            );
+        } else if (state === 'ready' && issue && issue.state === 'open') {
+            reasons.push(`Triage issue #${issue.number} is still open`);
+        }
+
         return {
             key: platform.key,
             label: platform.label,
             primary: platform.primary,
             state,
+            triaged,
+            triageIssue: issue,
             reasons,
             jdk: platform.jdk,
             jdkKind,
@@ -673,6 +691,168 @@ export const getSourceTag = (parent, lookup) => {
 };
 
 /**
+ * AQAvit release issues. The adoptium/aqa-tests create-release-issues workflow
+ * opens one parent issue per JDK version and release
+ * ("November 2026 Release AQAvit Activities - JDK21") and one issue per
+ * platform ("Triage Automated Tests for November 2026 JDK21 - x86-64_linux").
+ * A closed triage issue means the AQAvit and TCK failures of the platform have
+ * been triaged. Dry runs of the workflow prefix the titles with "Dry-run: ".
+ */
+export const aqaIssuesUrl = (version) =>
+    `https://api.github.com/repos/adoptium/aqa-tests/issues?labels=JDK${version}&state=all&per_page=100`;
+
+// release-openjdk21-pipeline -> 21
+export const pipelineVersion = (buildName) => {
+    const m = /openjdk(\d+)u?-pipeline/i.exec(buildName || '');
+    return m ? m[1] : null;
+};
+
+const MONTHS = [
+    'january',
+    'february',
+    'march',
+    'april',
+    'may',
+    'june',
+    'july',
+    'august',
+    'september',
+    'october',
+    'november',
+    'december',
+];
+const DAY_MS = 24 * 60 * 60 * 1000;
+// A parent issue is chosen by date only when it is this close to the pipeline
+const MAX_ISSUE_DISTANCE_MS = 45 * DAY_MS;
+
+// "November 2026" -> { start, end } in ms, or null
+const monthRange = (text) => {
+    const m = /^([a-z]+)\s+(\d{4})$/i.exec((text || '').trim());
+    const month = m ? MONTHS.indexOf(m[1].toLowerCase()) : -1;
+    if (month < 0) return null;
+    const year = Number(m[2]);
+    return {
+        start: Date.UTC(year, month, 1),
+        end: Date.UTC(year, month + 1, 1),
+    };
+};
+
+const PARENT_ISSUE_REGEX =
+    /^(Dry-run:\s*)?(\w+ \d{4}) Release AQAvit Activities - JDK(\d+)/i;
+const TRIAGE_ISSUE_REGEX =
+    /^(Dry-run:\s*)?Triage Automated Tests for (\w+ \d{4}) JDK(\d+) - (\S+)/i;
+
+// Parses the issues of the aqa-tests issues API into parents and triage issues
+export const parseAqaIssues = (issues) => {
+    const parents = [];
+    const triage = [];
+    (Array.isArray(issues) ? issues : []).forEach((issue) => {
+        if (!issue || issue.pull_request) return;
+        const base = {
+            number: issue.number,
+            url: issue.html_url,
+            title: issue.title,
+            state: issue.state === 'closed' ? 'closed' : 'open',
+            closedAt: issue.closed_at || null,
+        };
+        let m = PARENT_ISSUE_REGEX.exec(issue.title || '');
+        if (m) {
+            const url = /Pipeline URL:\s*(\S+)/i.exec(issue.body || '');
+            parents.push({
+                ...base,
+                dryRun: !!m[1],
+                month: m[2],
+                version: m[3],
+                pipelineUrl: url ? url[1] : null,
+            });
+            return;
+        }
+        m = TRIAGE_ISSUE_REGEX.exec(issue.title || '');
+        const key = m && toPlatformKey(m[4]);
+        if (key) {
+            triage.push({
+                ...base,
+                dryRun: !!m[1],
+                month: m[2],
+                version: m[3],
+                key,
+            });
+        }
+    });
+    return { parents, triage };
+};
+
+// https://ci.adoptium.net/job/build-scripts/job/release-openjdk21-pipeline/8/
+// -> { job: 'release-openjdk21-pipeline', num: '8' }
+const jobBuild = (url) => {
+    const m = /([^/]+)\/(\d+)\/?$/.exec(String(url || '').split(/[?#]/)[0]);
+    return m ? { job: m[1], num: m[2] } : null;
+};
+
+/**
+ * Find the parent AQAvit issue of a release pipeline and its triage issues.
+ *
+ * The Pipeline URL in the parent issue is the reliable link: it names the job
+ * and build number. When it is missing, the parent of the same JDK version
+ * whose month is closest to the pipeline start is used (dry-run issues are
+ * not considered, as their pipelines are not released).
+ *
+ * Returns { parent, triage: { platformKey: issue }, matchedBy } or null when
+ * there is no parent issue. When a platform has several triage issues, the
+ * newest one is used.
+ */
+export const selectAqaRelease = (issues, pipeline) => {
+    const version = pipelineVersion(pipeline && pipeline.buildName);
+    const { parents, triage } = parseAqaIssues(issues);
+    const own = parents.filter((p) => p.version === version);
+
+    const wanted = {
+        job: pipeline && pipeline.buildName,
+        num: String(pipeline && pipeline.buildNum),
+    };
+    let parent = own.find((p) => {
+        const found = jobBuild(p.pipelineUrl);
+        return found && found.job === wanted.job && found.num === wanted.num;
+    });
+    let matchedBy = 'pipeline';
+    if (!parent && pipeline && pipeline.timestamp) {
+        let best = Infinity;
+        own.filter((p) => !p.dryRun).forEach((p) => {
+            const range = monthRange(p.month);
+            if (!range) return;
+            const t = pipeline.timestamp;
+            const distance =
+                t < range.start
+                    ? range.start - t
+                    : t >= range.end
+                    ? t - range.end
+                    : 0;
+            if (distance <= MAX_ISSUE_DISTANCE_MS && distance < best) {
+                best = distance;
+                parent = p;
+            }
+        });
+        matchedBy = 'date';
+    }
+    if (!parent) return null;
+
+    const byKey = {};
+    triage
+        .filter(
+            (t) =>
+                t.version === parent.version &&
+                t.month === parent.month &&
+                t.dryRun === parent.dryRun
+        )
+        .forEach((t) => {
+            if (!byKey[t.key] || t.number > byKey[t.key].number) {
+                byKey[t.key] = t;
+            }
+        });
+    return { parent, triage: byKey, matchedBy };
+};
+
+/**
  * Short list of the activities that are still needed to complete the release.
  * An empty list means nothing is left.
  */
@@ -688,6 +868,14 @@ export const releaseNextSteps = ({
 }) => {
     const steps = [];
     const names = (list) => list.map((p) => p.label).join(', ');
+    const triageNames = (list) =>
+        list
+            .map((p) =>
+                p.triageIssue
+                    ? `${p.label} (issue #${p.triageIssue.number})`
+                    : p.label
+            )
+            .join(', ');
     const by = (state) => platforms.filter((p) => p.state === state);
 
     if (!publishedKnown) {
@@ -702,7 +890,7 @@ export const releaseNextSteps = ({
     }
     if (counts.triage) {
         steps.push(
-            `Triage the failures on ${counts.triage} platform(s): ${names(
+            `Triage the failures on ${counts.triage} platform(s): ${triageNames(
                 by('triage')
             )}`
         );
