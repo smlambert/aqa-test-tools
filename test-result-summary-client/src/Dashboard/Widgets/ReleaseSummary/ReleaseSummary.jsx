@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
     Alert,
+    Button,
     Collapse,
     Empty,
     List,
@@ -17,6 +18,7 @@ import {
     ExclamationCircleOutlined,
     LoadingOutlined,
     MinusCircleOutlined,
+    ReloadOutlined,
     StarFilled,
 } from '@ant-design/icons';
 import moment from 'moment';
@@ -221,6 +223,14 @@ const fetchAqaRelease = async (parent) => {
         console.error(e);
         return null;
     }
+};
+
+// A manual refresh must see changes on GitHub (e.g. a triage issue that was
+// just closed), so the cached lists are dropped. Commits and releasePlan.cfg
+// revisions never change and stay cached.
+const clearGithubCaches = () => {
+    revisionsCache = null;
+    aqaIssuesCache.clear();
 };
 
 const fetchTckResults = async (jckBuilds) => {
@@ -974,6 +984,11 @@ const ReleaseSummary = ({ pipelineSelected, onChange }) => {
         }
     }, []);
 
+    const refresh = () => {
+        clearGithubCaches();
+        load(pipelineSelected);
+    };
+
     useEffect(() => {
         if (!pipelineSelected) {
             requestId.current++;
@@ -994,30 +1009,41 @@ const ReleaseSummary = ({ pipelineSelected, onChange }) => {
 
     return (
         <div className="release-summary">
-            <Select
-                showSearch
-                allowClear
-                style={{ width: '100%', marginBottom: 8 }}
-                placeholder="Select a release pipeline"
-                loading={!options}
-                options={options || []}
-                value={pipelineSelected}
-                optionFilterProp="label"
-                onSelect={onSelect}
-                onClear={() =>
-                    onChange({
-                        pipelineSelected: undefined,
-                        pipelineLabel: undefined,
-                    })
-                }
-                notFoundContent={
-                    options ? (
-                        'No release pipelines found'
-                    ) : (
-                        <Spin size="small" />
-                    )
-                }
-            />
+            <div className="release-summary-select">
+                <Select
+                    showSearch
+                    allowClear
+                    style={{ flex: 1 }}
+                    placeholder="Select a release pipeline"
+                    loading={!options}
+                    options={options || []}
+                    value={pipelineSelected}
+                    optionFilterProp="label"
+                    onSelect={onSelect}
+                    onClear={() =>
+                        onChange({
+                            pipelineSelected: undefined,
+                            pipelineLabel: undefined,
+                        })
+                    }
+                    notFoundContent={
+                        options ? (
+                            'No release pipelines found'
+                        ) : (
+                            <Spin size="small" />
+                        )
+                    }
+                />
+                <Tooltip title="Refresh">
+                    <Button
+                        aria-label="Refresh"
+                        icon={<ReloadOutlined />}
+                        loading={loading}
+                        disabled={!pipelineSelected}
+                        onClick={refresh}
+                    />
+                </Tooltip>
+            </div>
             {!pipelineSelected && (
                 <Empty
                     image={Empty.PRESENTED_IMAGE_SIMPLE}

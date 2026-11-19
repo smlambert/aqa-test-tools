@@ -412,3 +412,53 @@ test('still renders when the aqa-tests issues cannot be read', async () => {
     expect(text).toContain('Platforms Published (2)');
     await act(async () => root.unmount());
 });
+
+test('the refresh button reloads the release and the GitHub issues', async () => {
+    aqaIssues = [
+        parentIssue,
+        aqaIssue(
+            101,
+            'Triage Automated Tests for November 2026 JDK21 - aarch64_linux'
+        ),
+    ];
+    const { container, root } = await renderSelected();
+    expect(container.textContent).toContain('Platforms Requiring Triage (1)');
+    const issueCalls = () =>
+        global.fetch.mock.calls.filter(([u]) =>
+            u.includes('repos/adoptium/aqa-tests/issues')
+        ).length;
+    expect(issueCalls()).toBe(1);
+
+    // the triage issue is closed on GitHub
+    aqaIssues = [
+        parentIssue,
+        aqaIssue(
+            101,
+            'Triage Automated Tests for November 2026 JDK21 - aarch64_linux',
+            { state: 'closed' }
+        ),
+    ];
+    await act(async () => {
+        container.querySelector('button[aria-label="Refresh"]').click();
+    });
+    await flush();
+    await flush();
+    expect(issueCalls()).toBe(2);
+    expect(container.textContent).toContain('Platforms Requiring Triage (0)');
+    expect(container.textContent).toContain('Platforms Ready to Publish (1)');
+    await act(async () => root.unmount());
+});
+
+test('the refresh button is disabled without a pipeline', async () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+        root.render(<ReleaseSummary onChange={jest.fn()} />);
+    });
+    await flush();
+    expect(
+        container.querySelector('button[aria-label="Refresh"]').disabled
+    ).toBe(true);
+    await act(async () => root.unmount());
+});

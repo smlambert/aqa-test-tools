@@ -2,6 +2,12 @@
     font-size: 13px;
 }
 
+.release-summary-select {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
 .release-summary-header {
     margin-bottom: 8px;
 }
