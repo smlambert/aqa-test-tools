@@ -496,3 +496,67 @@ test('lists the pipelines of every version without a version', async () => {
     ).toBe(1);
     await act(async () => root.unmount());
 });
+
+describe('TCK results', () => {
+    const tests = routes['^(Test|Perf)_openjdk.*'];
+    const originalTests = [...tests];
+    const jckKey = '^AQA_Test_Pipeline_JCK$';
+    const remoteKey = '/api/getRemoteJckBuildInfo';
+
+    afterEach(() => {
+        tests.splice(0, tests.length, ...originalTests);
+        routes[jckKey] = [];
+        delete routes[remoteKey];
+    });
+
+    // every AQA build passes, so only the TCK decides aarch64 Linux
+    const setUp = (remote) => {
+        tests.splice(0, tests.length, T('x86-64_linux'), T('x86-64_mac'));
+        tests.push(T('aarch64_linux'));
+        routes[jckKey] = [
+            b('AQA_Test_Pipeline_JCK', 'SUCCESS', { buildNum: 3 }),
+        ];
+        routes[remoteKey] = remote;
+    };
+    const jck = (target, buildResult) => ({
+        target,
+        platform: 'aarch64_linux',
+        jdkVersion: '21',
+        buildResult,
+        remoteUrl: `http://remote/${target}`,
+    });
+    const all = ['sanity', 'extended', 'special', 'dev'];
+
+    test('is ready when every required TCK target passed', async () => {
+        setUp(all.map((t) => jck(t, 'SUCCESS')));
+        const { container, root } = await renderSelected();
+        expect(container.textContent).toContain(
+            'Platforms Ready to Publish (1)'
+        );
+        expect(container.textContent).toContain(
+            'Platforms Requiring Triage (0)'
+        );
+        await act(async () => root.unmount());
+    });
+
+    test('needs triage when a TCK target has no status', async () => {
+        setUp(all.map((t) => jck(t, t === 'dev' ? null : 'SUCCESS')));
+        const { container, root } = await renderSelected();
+        expect(container.textContent).toContain(
+            'Platforms Requiring Triage (1)'
+        );
+        expect(container.textContent).toContain(
+            'Platforms Ready to Publish (0)'
+        );
+        await act(async () => root.unmount());
+    });
+
+    test('needs triage when the TCK status cannot be read', async () => {
+        setUp({ error: 'Error: remote Jenkins is not reachable' });
+        const { container, root } = await renderSelected();
+        expect(container.textContent).toContain(
+            'Platforms Requiring Triage (1)'
+        );
+        await act(async () => root.unmount());
+    });
+});

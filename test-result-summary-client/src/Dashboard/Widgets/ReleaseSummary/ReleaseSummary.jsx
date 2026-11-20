@@ -791,7 +791,7 @@ const NextSteps = ({ steps }) => (
     </div>
 );
 
-const Release = ({ data, tckResults }) => {
+const Release = ({ data, tckResults, tckLoaded }) => {
     const {
         parent,
         releaseName,
@@ -805,6 +805,7 @@ const Release = ({ data, tckResults }) => {
         sdkBuilds: data.sdkBuilds,
         testBuilds: data.testBuilds,
         tckResults,
+        tckLoaded,
         published: published || {},
         triageIssues: (aqaRelease && aqaRelease.triage) || {},
     });
@@ -946,6 +947,7 @@ const ReleaseSummary = ({ pipelineSelected, version, onChange }) => {
     const [options, setOptions] = useState(null);
     const [data, setData] = useState(null);
     const [tckResults, setTckResults] = useState([]);
+    const [tckLoaded, setTckLoaded] = useState(false);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
     const requestId = useRef(0);
@@ -974,12 +976,25 @@ const ReleaseSummary = ({ pipelineSelected, version, onChange }) => {
                 return;
             }
             setData(release);
-            setTckResults([]);
             // JCK results come from remote console logs; patch them in later
             // so a slow remote Jenkins never blocks the rest of the widget.
-            fetchTckResults(release.jckBuilds).then((results) => {
-                if (id === requestId.current) setTckResults(results);
-            });
+            // Until they are loaded, a platform is not ready to publish.
+            // Results of an earlier load stay on screen while a silent
+            // refresh reloads them.
+            if (!silent) {
+                setTckResults([]);
+                setTckLoaded(false);
+            }
+            fetchTckResults(release.jckBuilds)
+                .catch((e) => {
+                    console.error(e);
+                    return [];
+                })
+                .then((results) => {
+                    if (id !== requestId.current) return;
+                    setTckResults(results);
+                    setTckLoaded(true);
+                });
         } catch (e) {
             console.error(e);
             if (id === requestId.current) {
@@ -1061,7 +1076,11 @@ const ReleaseSummary = ({ pipelineSelected, version, onChange }) => {
             )}
             {error && <Alert type="error" showIcon message={error} />}
             {pipelineSelected && data && (
-                <Release data={data} tckResults={tckResults} />
+                <Release
+                    data={data}
+                    tckResults={tckResults}
+                    tckLoaded={tckLoaded}
+                />
             )}
         </div>
     );

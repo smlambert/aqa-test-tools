@@ -11,7 +11,9 @@ import {
     parseReleasePlanRevisions,
     pipelineRepo,
     releaseNextSteps,
+    isHeadlessPlatform,
     parseAqaIssues,
+    requiredTckTargets,
     parseSdkBuildName,
     parseTestBuildName,
     pipelineVersion,
@@ -98,6 +100,17 @@ describe('dedupeTestBuilds', () => {
     });
 });
 
+// Passing TCK results for the given platform keys (dev.jck is only run on
+// headful platforms)
+const tckPass = (keys, result = 'SUCCESS') =>
+    keys.flatMap((key) =>
+        requiredTckTargets(key).map((target) => ({
+            key,
+            target,
+            buildResult: result,
+        }))
+    );
+
 describe('buildPlatforms', () => {
     const sdkBuilds = [
         build('jdk21u-linux-x64-temurin'),
@@ -120,6 +133,7 @@ describe('buildPlatforms', () => {
         const platforms = buildPlatforms({
             sdkBuilds,
             testBuilds,
+            tckResults: tckPass(['x64_mac']),
             published: { x64_linux: { installer: false } },
         });
         const state = Object.fromEntries(
@@ -162,6 +176,128 @@ describe('buildPlatforms', () => {
             ],
         });
         expect(tck.state).toBe('triage');
+    });
+
+    describe('TCK results', () => {
+        const linux = [build('jdk21u-linux-x64-temurin')];
+        const aqa = [t('x86-64_linux')];
+        const platform = (extra) =>
+            buildPlatforms({ sdkBuilds: linux, testBuilds: aqa, ...extra })[0];
+
+        test('headless platforms do not need dev.jck', () => {
+            [
+                'aarch64_alpine-linux',
+                'x64_alpine-linux',
+                'riscv64_linux',
+                'ppc64_aix',
+                'ppc64le_linux',
+                's390x_linux',
+            ].forEach((key) => {
+                expect(isHeadlessPlatform(key)).toBe(true);
+                expect(requiredTckTargets(key)).toEqual([
+                    'sanity',
+                    'extended',
+                    'special',
+                ]);
+            });
+            expect(isHeadlessPlatform('x64_linux')).toBe(false);
+            expect(requiredTckTargets('x64_linux')).toEqual([
+                'sanity',
+                'extended',
+                'special',
+                'dev',
+            ]);
+        });
+
+        test('is ready when AQA and every required TCK target passed', () => {
+            const p = platform({ tckResults: tckPass(['x64_linux']) });
+            expect(p.state).toBe('ready');
+            expect(p.tckPassed).toEqual([
+                'sanity',
+                'extended',
+                'special',
+                'dev',
+            ]);
+            expect(p.tckMissing).toEqual([]);
+        });
+
+        test('a headless platform is ready without dev.jck', () => {
+            const [p] = buildPlatforms({
+                sdkBuilds: [build('jdk21u-linux-ppc64le-temurin')],
+                testBuilds: [t('ppc64le_linux')],
+                tckResults: tckPass(['ppc64le_linux']),
+            });
+            expect(p.state).toBe('ready');
+            expect(p.tckRequired).not.toContain('dev');
+        });
+
+        test('a missing TCK result needs triage', () => {
+            const results = tckPass(['x64_linux']).filter(
+                (r) => r.target !== 'dev'
+            );
+            const p = platform({ tckResults: results });
+            expect(p.state).toBe('triage');
+            expect(p.tckMissing).toEqual(['dev']);
+            expect(p.reasons).toEqual(['TCK result missing: dev']);
+        });
+
+        test('a TCK target without a status (e.g. unreadable) is missing', () => {
+            const results = tckPass(['x64_linux']).map((r) =>
+                r.target === 'special' ? { ...r, buildResult: null } : r
+            );
+            const p = platform({ tckResults: results });
+            expect(p.state).toBe('triage');
+            expect(p.tckMissing).toEqual(['special']);
+        });
+
+        test('no TCK results at all needs triage', () => {
+            const p = platform({});
+            expect(p.state).toBe('triage');
+            expect(p.tckMissing).toEqual([
+                'sanity',
+                'extended',
+                'special',
+                'dev',
+            ]);
+        });
+
+        test('a failed TCK target needs triage', () => {
+            const results = tckPass(['x64_linux']).map((r) =>
+                r.target === 'sanity' ? { ...r, buildResult: 'FAILURE' } : r
+            );
+            const p = platform({ tckResults: results });
+            expect(p.state).toBe('triage');
+            expect(p.reasons).toEqual(['1 TCK failed']);
+            expect(p.tckMissing).toEqual([]);
+        });
+
+        test('a closed triage issue moves missing TCK results to ready', () => {
+            const p = platform({
+                triageIssues: { x64_linux: { number: 9, state: 'closed' } },
+            });
+            expect(p.state).toBe('ready');
+            expect(p.triaged).toBe(true);
+        });
+
+        test('stays in progress while the TCK results are loading', () => {
+            const p = platform({
+                tckResults: tckPass(['x64_linux']),
+                tckLoaded: false,
+            });
+            expect(p.state).toBe('inprogress');
+            expect(p.reasons).toEqual(['TCK results loading']);
+        });
+
+        test('TCK does not change published platforms or running AQA', () => {
+            expect(platform({ published: { x64_linux: {} } }).state).toBe(
+                'published'
+            );
+            const [running] = buildPlatforms({
+                sdkBuilds: linux,
+                testBuilds: [t('x86-64_linux', null, { status: 'NotDone' })],
+            });
+            expect(running.state).toBe('inprogress');
+        });
     });
 
     test('smoke tests count as AQA builds', () => {
@@ -224,6 +360,7 @@ describe('triage issues', () => {
         const platforms = buildPlatforms({
             sdkBuilds,
             testBuilds,
+            tckResults: tckPass(['x64_mac']),
             published: { x64_linux: {} },
             triageIssues: {
                 x64_linux: issue(1, 'closed'),
@@ -241,6 +378,7 @@ describe('triage issues', () => {
         const platforms = buildPlatforms({
             sdkBuilds,
             testBuilds,
+            tckResults: tckPass(['x64_mac']),
             triageIssues: { x64_mac: issue(3, 'open') },
         });
         const p = platforms.find((x) => x.key === 'x64_mac');

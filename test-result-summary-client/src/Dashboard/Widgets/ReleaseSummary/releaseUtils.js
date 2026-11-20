@@ -44,6 +44,25 @@ export const platformLabel = (key) => {
 
 export const isPrimaryPlatform = (key) => PRIMARY_PLATFORMS.has(key);
 
+// TCK (JCK) targets that must be green before a platform can be published.
+// Headless platforms have no display, so they do not run dev.jck. This is the
+// HEADLESS_PLATFORMS list of the aqa-tests create-release-issues workflow plus
+// the platforms that have since moved to the headless category.
+const TCK_TARGETS = ['sanity', 'extended', 'special'];
+const HEADLESS_PLATFORMS = new Set([
+    'aarch64_alpine-linux',
+    'riscv64_linux',
+    'x64_alpine-linux',
+    'ppc64_aix',
+    'ppc64le_linux',
+    's390x_linux',
+]);
+
+export const isHeadlessPlatform = (key) => HEADLESS_PLATFORMS.has(key);
+
+export const requiredTckTargets = (key) =>
+    isHeadlessPlatform(key) ? TCK_TARGETS : [...TCK_TARGETS, 'dev'];
+
 // e.g. jdk21u-linux-x64-temurin, jdk21u-alpine-linux-aarch64-temurin,
 // jdk21u-windows-x86-32-temurin_SmokeTests
 const SDK_BUILD_REGEX =
@@ -109,9 +128,14 @@ export const dedupeTestBuilds = (testBuilds = []) => {
  *
  * state is one of:
  *   published  - binaries are available from the Adoptium API
- *   triage     - JDK build, AQA or TCK has a failure
- *   inprogress - build or tests still running (or no tests yet)
- *   ready      - JDK build and all AQA passed, not yet published
+ *   triage     - JDK build, AQA or TCK has a failure, or a required TCK
+ *                target has no result (e.g. the TCK status could not be read
+ *                from Jenkins)
+ *   inprogress - build or tests still running (or no tests yet), or the TCK
+ *                results are still loading (tckLoaded is false)
+ *   ready      - JDK build, all AQA and every required TCK target (sanity,
+ *                extended, special and, unless headless, dev) passed, not yet
+ *                published
  *                (or the failures were triaged: the triage issue is closed)
  */
 export const buildPlatforms = ({
@@ -120,6 +144,7 @@ export const buildPlatforms = ({
     tckResults = [],
     published = {},
     triageIssues = {},
+    tckLoaded = true,
 }) => {
     const platforms = {};
     const ensure = (key) => {
@@ -194,6 +219,27 @@ export const buildPlatforms = ({
         );
         const jdkKind = buildKind(platform.jdk);
 
+        // A target passed when it has a SUCCESS result and no failure. A
+        // target without a result is missing: the TCK status is read from the
+        // console of a remote Jenkins and may not be available.
+        const tckRequired = requiredTckTargets(platform.key);
+        const tckPassed = [];
+        const tckMissing = [];
+        tckRequired.forEach((target) => {
+            const results = platform.tck.filter((t) => t.target === target);
+            if (
+                results.some(
+                    (t) => t.buildResult && t.buildResult !== 'SUCCESS'
+                )
+            )
+                return;
+            if (results.some((t) => t.buildResult === 'SUCCESS')) {
+                tckPassed.push(target);
+            } else {
+                tckMissing.push(target);
+            }
+        });
+
         const reasons = [];
         if (jdkKind === 'fail') reasons.push('JDK build failed');
         if (aqa.failed) reasons.push(`${aqa.failed} AQA build(s) failed`);
@@ -205,9 +251,19 @@ export const buildPlatforms = ({
         } else if (reasons.length) {
             state = 'triage';
         } else if (
+            jdkKind === 'pass' &&
+            aqa.inProgress === 0 &&
+            aqa.total > 0 &&
+            tckLoaded &&
+            tckMissing.length
+        ) {
+            state = 'triage';
+            reasons.push(`TCK result missing: ${tckMissing.join(', ')}`);
+        } else if (
             jdkKind !== 'pass' ||
             aqa.inProgress > 0 ||
-            aqa.total === 0
+            aqa.total === 0 ||
+            !tckLoaded
         ) {
             state = 'inprogress';
             if (jdkKind === 'none') reasons.push('JDK build not found');
@@ -217,6 +273,7 @@ export const buildPlatforms = ({
             else if (aqa.inProgress) {
                 reasons.push(`${aqa.inProgress} AQA build(s) running`);
             }
+            if (!tckLoaded) reasons.push('TCK results loading');
         } else {
             state = 'ready';
         }
@@ -248,6 +305,9 @@ export const buildPlatforms = ({
             aqa,
             tck: platform.tck,
             tckFailed,
+            tckRequired,
+            tckPassed,
+            tckMissing,
         };
     });
 
