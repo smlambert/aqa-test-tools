@@ -263,7 +263,8 @@ const fetchTckResults = async (jckBuilds) => {
     return results;
 };
 
-const loadPipelines = async () => {
+// version limits the pipelines to one JDK version (e.g. '21')
+const loadPipelines = async (version) => {
     const lists = await Promise.all(
         ['Build', 'Test'].map((type) =>
             fetchData(`/api/getTopLevelBuildNames?type=${type}`)
@@ -274,7 +275,11 @@ const loadPipelines = async () => {
     lists.forEach((list) =>
         (Array.isArray(list) ? list : []).forEach(({ _id }) => {
             const key = `${_id.url}|${_id.buildName}`;
-            if (PIPELINE_REGEX.test(_id.buildName) && !seen.has(key)) {
+            if (
+                PIPELINE_REGEX.test(_id.buildName) &&
+                (!version || pipelineVersion(_id.buildName) === version) &&
+                !seen.has(key)
+            ) {
                 seen.add(key);
                 names.push(_id);
             }
@@ -937,7 +942,7 @@ const Release = ({ data, tckResults }) => {
     );
 };
 
-const ReleaseSummary = ({ pipelineSelected, onChange }) => {
+const ReleaseSummary = ({ pipelineSelected, version, onChange }) => {
     const [options, setOptions] = useState(null);
     const [data, setData] = useState(null);
     const [tckResults, setTckResults] = useState([]);
@@ -947,13 +952,14 @@ const ReleaseSummary = ({ pipelineSelected, onChange }) => {
 
     useEffect(() => {
         let cancelled = false;
-        loadPipelines().then((groups) => {
+        setOptions(null);
+        loadPipelines(version).then((groups) => {
             if (!cancelled) setOptions(groups);
         });
         return () => {
             cancelled = true;
         };
-    }, []);
+    }, [version]);
 
     const load = useCallback(async (parentId, silent) => {
         const id = ++requestId.current;

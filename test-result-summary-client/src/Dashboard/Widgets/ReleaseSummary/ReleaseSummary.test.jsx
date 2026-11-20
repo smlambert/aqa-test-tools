@@ -462,3 +462,37 @@ test('the refresh button is disabled without a pipeline', async () => {
     ).toBe(true);
     await act(async () => root.unmount());
 });
+
+const renderVersion = async (version) => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+        root.render(<ReleaseSummary version={version} onChange={jest.fn()} />);
+    });
+    await flush();
+    return { container, root };
+};
+
+test('lists only the pipelines of the tab version', async () => {
+    const { root } = await renderVersion('21');
+    const historyCalls = () =>
+        fetchData.mock.calls.filter(([u]) => u.includes('getBuildHistory'));
+    expect(historyCalls().length).toBe(1);
+    expect(historyCalls()[0][0]).toContain('release-openjdk21-pipeline');
+    await act(async () => root.unmount());
+
+    fetchData.mockClear();
+    const other = await renderVersion('17');
+    expect(historyCalls().length).toBe(0);
+    await act(async () => other.root.unmount());
+});
+
+test('lists the pipelines of every version without a version', async () => {
+    const { root } = await renderVersion(undefined);
+    expect(
+        fetchData.mock.calls.filter(([u]) => u.includes('getBuildHistory'))
+            .length
+    ).toBe(1);
+    await act(async () => root.unmount());
+});
